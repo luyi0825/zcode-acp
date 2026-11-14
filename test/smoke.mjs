@@ -203,7 +203,56 @@ try {
     check("选中模型下有回复", modelText.length > 0, JSON.stringify(modelText));
   }
 
-  // 10. 思考级别：configOptions 声明 → set_config_option → load 回显 → prompt 可跑
+  // 10. 权限模式：modes 声明 → set_mode → 通知 → load 回显 → 选中模式下可跑
+  const modeSession = await client.request("session/new", { cwd, mcpServers: [] });
+  const modes = modeSession.modes ?? {};
+  check(
+    "session/new 声明权限模式",
+    modes.currentModeId === "yolo" && (modes.availableModes ?? []).some((m) => m.id === "plan"),
+    JSON.stringify(modes).slice(0, 200),
+  );
+  const beforeModeUpdate = client.updates.length;
+  const setMode = await client.request("session/set_mode", {
+    sessionId: modeSession.sessionId,
+    modeId: "plan",
+  });
+  check("session/set_mode 不报错", !setMode.error, JSON.stringify(setMode).slice(0, 120));
+  check(
+    "set_mode 后广播 current_mode_update",
+    client.updates
+      .slice(beforeModeUpdate)
+      .some((u) => u.sessionUpdate === "current_mode_update" && u.currentModeId === "plan"),
+  );
+  const badMode = await client.request("session/set_mode", {
+    sessionId: modeSession.sessionId,
+    modeId: "turbo",
+  });
+  check("session/set_mode 非法值不报错", !badMode.error, JSON.stringify(badMode).slice(0, 120));
+  const modeReloaded = await client.request("session/load", {
+    sessionId: modeSession.sessionId,
+    cwd,
+    mcpServers: [],
+  });
+  check(
+    "session/load 回显选中模式",
+    modeReloaded.modes?.currentModeId === "plan",
+    JSON.stringify(modeReloaded.modes?.currentModeId),
+  );
+  // 选中模式（plan 只读）下跑一轮：纯文本回复不受工具限制
+  const modeMark = client.updates.length;
+  const r6 = await client.request("session/prompt", {
+    sessionId: modeSession.sessionId,
+    prompt: [{ type: "text", text: "Reply with only: PONG" }],
+  });
+  const modeText = client.updates
+    .slice(modeMark)
+    .filter((u) => u.sessionUpdate === "agent_message_chunk")
+    .map((u) => u.content.text)
+    .join("");
+  check("选中模式下 stopReason=end_turn", r6.stopReason === "end_turn", JSON.stringify(r6));
+  check("选中模式下有回复", modeText.length > 0, JSON.stringify(modeText));
+
+  // 11. 思考级别：configOptions 声明 → set_config_option → 通知 → load 回显 → prompt 可跑
   const reasonSession = await client.request("session/new", { cwd, mcpServers: [] });
   const reasonOption = (reasonSession.configOptions ?? []).find((o) => o.id === "reasoning");
   check(
@@ -211,12 +260,23 @@ try {
     reasonOption?.currentValue === "max" && reasonOption.options.some((o) => o.value === "low"),
     JSON.stringify(reasonSession.configOptions).slice(0, 200),
   );
+  const beforeOptionUpdate = client.updates.length;
   const setOption = await client.request("session/set_config_option", {
     sessionId: reasonSession.sessionId,
     configId: "reasoning",
     value: "low",
   });
   check("session/set_config_option 不报错", !setOption.error, JSON.stringify(setOption).slice(0, 120));
+  check(
+    "set_config_option 后广播 config_option_update",
+    client.updates
+      .slice(beforeOptionUpdate)
+      .some(
+        (u) =>
+          u.sessionUpdate === "config_option_update" &&
+          (u.configOptions ?? []).some((o) => o.id === "reasoning" && o.currentValue === "low"),
+      ),
+  );
   const badOption = await client.request("session/set_config_option", {
     sessionId: reasonSession.sessionId,
     configId: "reasoning",

@@ -11,7 +11,20 @@ import { attachClient, emitText, emitUpdate } from "./emitter.js";
 import { loadDefaultRuntimeEnv } from "./runtime-env.js";
 import { encodeModelId, findModel, isKnownReasoningLevel, listModels, REASONING_LEVELS } from "./models.js";
 
-export const AGENT_INFO = { name: "zcode-acp-bridge", title: "ZCode", version: "0.3.0" };
+export const AGENT_INFO = { name: "zcode-acp-bridge", title: "ZCode", version: "0.4.0" };
+
+// 权限模式：id 沿用 zcode 原生枚举（--mode 的合法取值），跨端语义一致。
+// 默认 yolo：headless 没有确认入口，与 zcode 对 --prompt 的默认一致；
+// plan（只读）/ guarded（最严）等受控模式由客户端按需选择。
+const DEFAULT_MODE = "yolo";
+const MODES = [
+  { id: "plan", name: "Plan" },
+  { id: "build", name: "Build" },
+  { id: "edit", name: "Edit" },
+  { id: "guarded", name: "Guarded" },
+  { id: "yolo", name: "Yolo" },
+];
+const MODE_IDS = new Set(MODES.map((mode) => mode.id));
 
 // 会话记录（本进程签发）。客户端回传的会话 id 只做等值比对，
 // 命中的始终是本地记录对象，外部值不参与任何寻址。
@@ -75,6 +88,18 @@ const REASONING_OPTION_ID = "reasoning";
 const REASONING_NAMES = { low: "低", high: "高", max: "最大" };
 
 /**
+ * 会话响应里的 modes 声明（ACP 旧版字段，与 configOptions 并存）。
+ * 客户端（编辑器等）据此渲染模式下拉框；当前值来自 record.mode，
+ * 未选择时回显默认 yolo。
+ */
+function modesPayload(record) {
+  return {
+    availableModes: MODES,
+    currentModeId: record?.mode ?? DEFAULT_MODE,
+  };
+}
+
+/**
  * 思考级别选项（configOptions 形态）。未选择时回显 "max"，
  * 与 headless 不设置 optionSpecs 时的默认级别一致（实测）。
  */
@@ -125,12 +150,14 @@ export function startAgent() {
         zcodeSessionId: undefined,
         model: null,
         reasoningLevel: null,
+        mode: null,
         stop: null,
       };
       records.push(record);
       return {
         sessionId: record.id,
         models: modelsPayload(record),
+        modes: modesPayload(record),
         configOptions: configOptionsPayload(record),
       };
     })
@@ -138,19 +165,21 @@ export function startAgent() {
       // 客户端的 IM 多轮对话会带着旧 sessionId 调 resume。bridge 进程重启后内存记录
       // 必然丢失，报 Resource not found 会让对话从第二轮起全部失败；
       // 正确做法是接受该 id 并重建记录（zcode 侧上下文丢了，由客户端重发消息弥补）。
-      // 已有记录只刷新 cwd，保留 zcodeSessionId / model / reasoningLevel，续接与选型不丢。
+      // 已有记录只刷新 cwd，保留 zcodeSessionId / model / reasoningLevel / mode，续接与选型不丢。
       const existing = findRecord(ctx.params.sessionId);
       const record = existing ?? {
         id: String(ctx.params.sessionId),
         zcodeSessionId: undefined,
         model: null,
         reasoningLevel: null,
+        mode: null,
         stop: null,
       };
       record.cwd = normalizeCwd(ctx.params.cwd);
       if (!existing) records.push(record);
       return {
         models: modelsPayload(record),
+        modes: modesPayload(record),
         configOptions: configOptionsPayload(record),
       };
     })
@@ -164,12 +193,14 @@ export function startAgent() {
         zcodeSessionId: undefined,
         model: null,
         reasoningLevel: null,
+        mode: null,
         stop: null,
       };
       record.cwd = normalizeCwd(ctx.params.cwd);
       if (!existing) records.push(record);
       return {
         models: modelsPayload(record),
+        modes: modesPayload(record),
         configOptions: configOptionsPayload(record),
       };
     })
@@ -189,12 +220,31 @@ export function startAgent() {
         return {};
       },
     )
+    // ACP 标准的模式设置：modeId 必须在 zcode 支持的模式枚举内，
+    // 非法值静默忽略保持当前模式。设置成功后广播 current_mode_update，
+    // 让编辑器的模式下拉框即时刷新（借鉴 zcode-acp-server 的做法）。
+    .onRequest(
+      "session/set_mode",
+      (params) => (typeof params === "object" && params !== null ? params : {}),
+      async (ctx) => {
+        const record = findRecord(ctx.params.sessionId);
+        if (record && MODE_IDS.has(ctx.params.modeId)) {
+          record.mode = ctx.params.modeId;
+          await emitUpdate(record.id, {
+            sessionUpdate: "current_mode_update",
+            currentModeId: record.mode,
+          }).catch(() => {});
+        }
+        return {};
+      },
+    )
     // ACP 标准的配置选项设置：configId 为本 agent 声明的选项 id。
     // 只接受思考级别选项且值在认可集合内；其余静默忽略，保持当前值。
+    // 设置成功后广播 config_option_update（全量选项），让客户端 UI 即时刷新。
     .onRequest(
       "session/set_config_option",
       (params) => (typeof params === "object" && params !== null ? params : {}),
-      (ctx) => {
+      async (ctx) => {
         const record = findRecord(ctx.params.sessionId);
         if (
           record &&
@@ -202,6 +252,10 @@ export function startAgent() {
           isKnownReasoningLevel(ctx.params.value)
         ) {
           record.reasoningLevel = ctx.params.value;
+          await emitUpdate(record.id, {
+            sessionUpdate: "config_option_update",
+            configOptions: configOptionsPayload(record),
+          }).catch(() => {});
         }
         return {};
       },
@@ -221,6 +275,7 @@ export function startAgent() {
           cwd: record.cwd,
           text,
           resume: record.zcodeSessionId,
+          mode: record.mode ?? DEFAULT_MODE,
           // 思考级别随模型一起进 provider 配置副本（见 models.js）。
           model: record.model
             ? { ...record.model, reasoningLevel: record.reasoningLevel ?? undefined }

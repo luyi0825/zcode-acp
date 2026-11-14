@@ -14,6 +14,11 @@ const WIN = process.platform === "win32";
 // ZCode 安装根下的固定相对路径，可执行文件只能从这里派生。
 const CLI_RELATIVE = path.join("resources", "glm", "zcode.cjs");
 
+// zcode 支持的权限模式（--mode 的合法取值，与 CLI 帮助一致）。
+// 白名单双重防线：agent 层校验后，这里在 spawn 前再校验一次，
+// 非法值一律回落 yolo，外部输入不可能以任意形态进入命令行。
+const MODES = new Set(["plan", "build", "edit", "guarded", "yolo"]);
+
 /**
  * 安装根候选（按平台，可移植顺序）。
  * 规则：
@@ -130,12 +135,14 @@ function onNdjsonStream(readable, onEvent) {
  * 构造 zcode 命令行参数。
  *
  * 规则：
- * - 提示词用 `--prompt=<text>` 等号形式传入：ACP 客户端下发的文本是完全外部输入，
- *   若作为独立 argv 出现，以 `-` 开头会被 zcode 当成选项（选项注入）。
- *   等号形式让整个值固定绑定在 --prompt 上，不可能被解析成其他选项。
+ * - 提示词与模式都用 `--opt=<value>` 等号形式传入：值是完全外部输入，若作为独立
+ *   argv 出现，以 `-` 开头会被 zcode 当成选项（选项注入）。等号形式让整个值
+ *   固定绑定在选项上，不可能被解析成其他选项。mode 在进入本函数前已过
+ *   MODES 白名单（plan/build/edit/guarded/yolo 之一），缺省 yolo 与 zcode
+ *   对 --prompt 的默认一致（headless 无确认入口）。
  * - cwd 是本地归一化后的绝对路径。
  */
-function buildArgs({ cli, text, cwd, resume }) {
+function buildArgs({ cli, text, cwd, resume, mode }) {
   return [
     cli,
     `--prompt=${text}`,
@@ -143,9 +150,7 @@ function buildArgs({ cli, text, cwd, resume }) {
     "stream-json",
     "--cwd",
     cwd,
-    // headless 模式下没有权限确认入口，直接放开，否则工具调用会挂住。
-    "--mode",
-    "yolo",
+    `--mode=${mode}`,
     ...(resume ? ["--resume", resume] : []),
   ];
 }
@@ -162,6 +167,7 @@ function buildArgs({ cli, text, cwd, resume }) {
  * @param {string} opts.cwd 工作目录（已归一化的绝对路径）
  * @param {string} opts.text 用户输入
  * @param {string} [opts.resume] 上一轮产出的 zcode sessionId
+ * @param {string} [opts.mode] 权限模式；白名单外或缺省一律按 yolo 执行
  * @param {{providerId: string, modelId: string, reasoningLevel?: string}} [opts.model]
  *   选中的模型与思考级别；headless 无对应参数，靠 provider 配置副本驱动
  *   默认模型与默认思考级别（见 models.js）
@@ -169,8 +175,10 @@ function buildArgs({ cli, text, cwd, resume }) {
  * @param {(e: object) => void} opts.onEvent 每个 stream-json 事件回调
  * @returns {Promise<{sessionId?: string, content?: string, error?: string, cancelled?: boolean}>}
  */
-export function runTurn({ cwd, text, resume, model, onStart, onEvent }) {
+export function runTurn({ cwd, text, resume, mode, model, onStart, onEvent }) {
   const { node, cli } = resolveZcode();
+  // spawn 前的白名单门卫：只放行枚举内的已知模式。
+  const safeMode = MODES.has(mode) ? mode : "yolo";
 
   const env = { ...process.env };
   // 被其它宿主拉起时不继承 ZCode Desktop 的运行时环境：缺 ZCODE_DATA_BASE_DIR 会去
@@ -185,7 +193,7 @@ export function runTurn({ cwd, text, resume, model, onStart, onEvent }) {
   }
 
   return new Promise((resolve) => {
-    const child = spawn(node, buildArgs({ cli, text, cwd, resume }), {
+    const child = spawn(node, buildArgs({ cli, text, cwd, resume, mode: safeMode }), {
       cwd,
       env,
       windowsHide: true,

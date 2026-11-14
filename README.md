@@ -66,12 +66,13 @@ command = 'zcode-acp-bridge'
 Linux 服务器等无 OS keyring 的环境：设置 `ZCODE_CREDENTIAL_SECRET` 环境变量
 （32–4096 字节的密钥串）后 login。
 
-## 模型选择与思考级别
+## 模型选择、思考级别与权限模式
 
 bridge 在 `session/new` / `session/load` / `session/resume` 里报告真实模型列表
-（来自 ZCode 的 personal provider 配置，按 providerOrder × modelOrder 展开）与
-思考级别选项（`configOptions` 的 `reasoning`：low / high / max），客户端的模型
-选择器、思考级别选择器直接可用。
+（来自 ZCode 的 personal provider 配置，按 providerOrder × modelOrder 展开）、
+思考级别选项（`configOptions` 的 `reasoning`：low / high / max）与权限模式
+（`modes`：plan / build / edit / guarded / yolo），客户端的模型选择器、思考级别
+选择器、模式下拉框直接可用。
 
 实现背景（实测逆向 zcode CLI 得出）：headless（`-p`）模式没有切换模型/思考级别的
 参数，其默认模型取 provider 配置里 `providerOrder[0]` 的 `modelOrder[0]`，默认
@@ -87,9 +88,13 @@ provider 配置副本**（临时目录，随机文件名）喂给子进程——
 - 每轮 prompt 独立 spawn `zcode -p --output-format stream-json --mode yolo`，
   多轮上下文由 `--resume <sessionId>` 续接；
 - 提示词以 `--prompt=<text>` 等号形式传入，客户端输入不可能被解析成 CLI 选项；
-- **权限模式为 yolo**：客户端下发的任务会无确认读写文件、执行命令，
-  只接入你信任的客户端；
-- stream-json 事件翻译为 ACP 更新：文本/推理增量、工具调用与结果、token 用量。
+- **权限模式**：客户端可通过 `session/set_mode` 选择 plan（只读）/ build / edit /
+  guarded / yolo，映射到 zcode 原生 `--mode`；默认 yolo（headless 无确认入口，
+  任务会无确认读写文件、执行命令，只接入你信任的客户端），需要受控执行时切
+  plan / guarded；
+- stream-json 事件翻译为 ACP 更新：文本/推理增量、工具调用与结果、token 用量；
+- 模式 / 模型 / 思考级别选择后广播 `current_mode_update` / `config_option_update`，
+  客户端 UI 即时刷新。
 
 ## 排障
 
@@ -104,7 +109,7 @@ provider 配置副本**（临时目录，随机文件名）喂给子进程——
 
 ```bash
 npm install
-npm run smoke          # 24 项协议自测（需要本机已登录 zcode）
+npm run smoke          # 32 项协议自测（需要本机已登录 zcode）
 ```
 
 可选：构建不依赖 Node 的单文件可执行程序（部分宿主只接受真 .exe）：
