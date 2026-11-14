@@ -1,0 +1,5 @@
+node_modules/
+*.log
+build/bundle.cjs
+build/sea-prep.blob
+build/*.exe

@@ -1,0 +1,34 @@
+{
+  "name": "zcode-acp-bridge",
+  "version": "0.3.0",
+  "description": "ACP v1 agent that bridges the ZCode CLI, so ACP clients (Zed, Neovim, OpenIdea, ...) can use ZCode as their coding agent",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "zcode-acp-bridge": "./bin/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin",
+    "src",
+    "test",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "smoke": "node test/smoke.mjs"
+  },
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "zcode",
+    "zai",
+    "agent",
+    "cli"
+  ],
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^2.6.0"
+  }
+}
