@@ -1,9 +1,11 @@
 // 自测：起一个本地 ACP 客户端，经 CLI 入口直连 bridge，验证 initialize /
-// session/new / session/prompt 流式文本 / 多轮续接 / cancel / 模型选择 / 思考级别。
+// session/new / session/prompt 流式文本 / 多轮续接 / cancel / 模型选择 / 思考级别 /
+// 权限模式 / 通用客户端注册器。
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { registerAllClients } from "../src/register.js";
 
 const BRIDGE = path.resolve(import.meta.dirname, "../bin/cli.js");
 const cwd = mkdtempSync(path.join(tmpdir(), "zcode-acp-smoke-"));
@@ -307,6 +309,43 @@ try {
     .join("");
   check("选中思考级别下 stopReason=end_turn", r5.stopReason === "end_turn", JSON.stringify(r5));
   check("选中思考级别下有回复", reasonText.length > 0, JSON.stringify(reasonText));
+
+  // 12. 通用注册器：临时目录模拟 OpenIdea 与 Zed（含 JSONC 注释与既有配置）
+  const fakeAppData = mkdtempSync(path.join(tmpdir(), "zcode-acp-register-"));
+  mkdirSync(path.join(fakeAppData, "ai.l0ng.openidea"), { recursive: true });
+  mkdirSync(path.join(fakeAppData, "Zed"), { recursive: true });
+  writeFileSync(
+    path.join(fakeAppData, "Zed", "settings.json"),
+    `// Zed settings\n// 注释必须保留\n{\n  "theme": "dark",\n  "agent_servers": {\n    "kimi": { "type": "registry" }\n  },\n  "ui_font_size": 16\n}\n`,
+    "utf8",
+  );
+  const results = registerAllClients(fakeAppData);
+  check(
+    "注册器处理两个已装客户端",
+    results.length === 2 && results.every((line) => line.startsWith("[ok]")),
+    JSON.stringify(results),
+  );
+  const toml = readFileSync(path.join(fakeAppData, "ai.l0ng.openidea", "agents", "zcode.toml"), "utf8");
+  check("OpenIdea toml 写入", toml.includes('name = "ZCode"') && toml.includes("args = ["), toml);
+  const zed = readFileSync(path.join(fakeAppData, "Zed", "settings.json"), "utf8");
+  check(
+    "Zed settings 合并且保留注释与既有条目",
+    zed.includes("// 注释必须保留") &&
+      zed.includes('"kimi": { "type": "registry" }') &&
+      zed.includes('"zcode"') &&
+      zed.includes('"ui_font_size": 16'),
+    zed,
+  );
+  const reparsed = JSON.parse(zed.replace(/^[ \t]*\/\/.*$/gm, ""));
+  check(
+    "Zed 条目为官方 Custom Agent 格式",
+    reparsed.agent_servers.zcode.type === "custom" && reparsed.agent_servers.zcode.command === "node",
+    JSON.stringify(reparsed.agent_servers),
+  );
+  // 幂等：重复注册不产生重复条目
+  registerAllClients(fakeAppData);
+  const zedAgain = readFileSync(path.join(fakeAppData, "Zed", "settings.json"), "utf8");
+  check("Zed 重复注册幂等", (zedAgain.match(/"zcode"/g) ?? []).length === 1, zedAgain);
 } catch (err) {
   check("smoke 执行未抛异常", false, String(err));
 } finally {

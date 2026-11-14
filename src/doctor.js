@@ -9,6 +9,7 @@ import path from "node:path";
 import { resolveZcode, runTurn } from "./zcode.js";
 import { listModels } from "./models.js";
 import { defaultEnvFile, loadDefaultRuntimeEnv, RUNTIME_ENV_KEYS } from "./runtime-env.js";
+import { registerAllClients } from "./register.js";
 
 /**
  * 自检并打印结果。
@@ -90,7 +91,7 @@ function exportRuntimeEnvFile() {
   return entries.length;
 }
 
-/** setup：自检 + Desktop 环境导出 + 客户端接入片段。 */
+/** setup：自检 + Desktop 环境导出 + 向已装客户端自动注册。 */
 export async function runSetup() {
   const healthy = await runDoctor();
   console.log();
@@ -105,19 +106,21 @@ export async function runSetup() {
     console.warn("检测到 Desktop 环境但没有可导出的变量，请在 ZCode Desktop 打开的终端里运行 setup。");
   }
 
-  console.log(`
-客户端接入（command 均为 zcode-acp-bridge，走 PATH 解析）：
-
-  Zed        settings.json:
-             { "agent_servers": { "zcode": { "command": "zcode-acp-bridge", "args": [] } } }
-
-  OpenIdea   %APPDATA%/<OpenIdea>/agents/zcode.toml:
-             name = "ZCode"
-             command = 'zcode-acp-bridge'
-
-  其它 ACP 客户端
-             以 stdio NDJSON 拉起 zcode-acp-bridge（无参数即 ACP 服务）。
-
-提示词经 --prompt=<text> 等号形式传入，客户端输入不会逃逸成 CLI 选项。`);
+  // 通用注册：向本机所有已装的 ACP 客户端写入 agent 入口（客户端发现制，
+  // 模式对齐 Claude 生态）。未装的客户端自动跳过。
+  console.log("\n注册到本机 ACP 客户端：");
+  const appDataDir = process.env.APPDATA ?? process.env.HOME;
+  if (!appDataDir) {
+    console.warn("  [warn] 找不到配置目录（APPDATA/HOME 均未设置），跳过注册");
+  } else {
+    const results = registerAllClients(appDataDir);
+    if (results.length === 0) {
+      console.log("  未检测到已装的 ACP 客户端（OpenIdea / Zed），可手接其它客户端：");
+      console.log("  以 stdio NDJSON 拉起 zcode-acp（无参数即 ACP 服务）。");
+    } else {
+      for (const line of results) console.log(`  ${line}`);
+      console.log("\n  重启客户端后生效。");
+    }
+  }
   return healthy;
 }

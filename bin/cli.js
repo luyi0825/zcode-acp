@@ -16,7 +16,8 @@ function printHelp() {
                                  --no-browser 只打印授权 URL，不开浏览器
   zcode-acp-bridge logout         退出登录
   zcode-acp-bridge doctor         安装自检（--probe 实跑一轮验证）
-  zcode-acp-bridge setup          自检 + 引导 + 打印客户端接入片段
+  zcode-acp-bridge setup          自检 + 认证导出 + 自动注册到本机 ACP 客户端
+                                 （OpenIdea / Zed，装了哪个注册哪个）
   zcode-acp-bridge --version      输出版本号
 `);
 }
@@ -26,6 +27,9 @@ const [command, ...rest] = process.argv.slice(2);
 switch (command) {
   case undefined:
   case "serve":
+  // acp 是 ACP 生态的约定入口名（opencode/kimi/pool 的 agent server 均以
+  // `<cmd> acp` 拉起），等价 serve。
+  case "acp":
     startAgent();
     break;
   case "--version":
