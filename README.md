@@ -21,11 +21,11 @@ bridge 只做协议翻译：ZCode 的 agent 能力（工具、skills、MCP、hoo
 
 ```bash
 npm install -g zcode-acp-bridge
-zcode-acp-bridge login      # 浏览器授权登录（一次性）
-zcode-acp-bridge doctor     # 自检：CLI 定位 / 登录态 / 模型列表
+zcode-acp login      # 浏览器授权登录（一次性）
+zcode-acp doctor     # 自检：CLI 定位 / 登录态 / 模型列表
 ```
 
-`zcode-acp-bridge setup` 可一次完成自检并打印各客户端的接入配置；
+`zcode-acp setup` 可一次完成自检并打印各客户端的接入配置；
 `doctor --probe` 会实跑一轮 headless 对话做端到端验证。
 
 ## 客户端接入
@@ -35,7 +35,7 @@ zcode-acp-bridge doctor     # 自检：CLI 定位 / 登录态 / 模型列表
 `settings.json`：
 
 ```json
-{ "agent_servers": { "zcode": { "command": "zcode-acp-bridge", "args": [] } } }
+{ "agent_servers": { "zcode": { "command": "zcode-acp", "args": [] } } }
 ```
 
 ### OpenIdea
@@ -44,22 +44,22 @@ agent 文件（`<配置目录>/agents/zcode.toml`）：
 
 ```toml
 name = "ZCode"
-command = 'zcode-acp-bridge'
+command = 'zcode-acp'
 ```
 
 ### 其它 ACP 客户端
 
-以 stdio NDJSON 拉起 `zcode-acp-bridge`（无参数即 ACP 服务），按 ACP v1 协议交互。
+以 stdio NDJSON 拉起 `zcode-acp`（无参数即 ACP 服务），按 ACP v1 协议交互。
 
 ## 认证
 
 两条路径，按你的使用方式选其一：
 
-1. **独立登录（推荐）**：`zcode-acp-bridge login` 走浏览器授权（设备授权码轮询，
+1. **独立登录（推荐）**：`zcode-acp login` 走浏览器授权（设备授权码轮询，
    无需本地回调），凭据存 `~/.zcode/v2/credentials.json`（AES-256-GCM 加密，
    密钥在 OS keyring）。全程不依赖 ZCode Desktop 运行。
 2. **ZCode Desktop 用户（数据目录被重定向）**：在 Desktop 打开的终端里运行
-   `zcode-acp-bridge setup`，自动把 Desktop 签发的运行时变量导出到
+   `zcode-acp setup`，自动把 Desktop 签发的运行时变量导出到
    `~/.zcode-acp.env`（bridge 启动时默认读取）。Desktop 重启后这些变量会更换，
    届时重新运行一次 `setup` 即可。
 
@@ -100,10 +100,10 @@ provider 配置副本**（临时目录，随机文件名）喂给子进程——
 
 | 症状 | 处理 |
 | --- | --- |
-| `401 API Key 不存在` | 未登录或认证过期：`zcode-acp-bridge login`（Desktop 用户：在 Desktop 终端里 `setup`） |
+| `401 API Key 不存在` | 未登录或认证过期：`zcode-acp login`（Desktop 用户：在 Desktop 终端里 `setup`） |
 | `找不到 zcode.cjs` | 安装 ZCode Desktop，或设 `ZCODE_HOME` 指向安装目录 |
-| 模型列表为空 / 选不了模型 | `zcode-acp-bridge doctor` 看第 4 项；通常是未登录（provider 配置未生成） |
-| Windows 下客户端拉不起 | 确认 `where zcode-acp-bridge` 能命中 npm 全局 bin，必要时重开客户端 |
+| 模型列表为空 / 选不了模型 | `zcode-acp doctor` 看第 4 项；通常是未登录（provider 配置未生成） |
+| Windows 下客户端拉不起 | 确认 `where zcode-acp` 能命中 npm 全局 bin，必要时重开客户端 |
 
 ## 开发
 

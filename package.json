@@ -5,7 +5,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "zcode-acp-bridge": "./bin/cli.js"
+    "zcode-acp": "./bin/cli.js"
   },
   "engines": {
     "node": ">=20"
