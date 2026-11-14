@@ -326,7 +326,11 @@ try {
     JSON.stringify(results),
   );
   const toml = readFileSync(path.join(fakeAppData, "ai.l0ng.openidea", "agents", "zcode.toml"), "utf8");
-  check("OpenIdea toml 写入", toml.includes('name = "ZCode"') && toml.includes("args = ["), toml);
+  check(
+    "OpenIdea toml 写入（PATH 裸名，无用户路径）",
+    toml.includes('name = "ZCode"') && toml.includes("command = 'zcode-acp'") && !toml.includes(":\\"),
+    toml,
+  );
   const zed = readFileSync(path.join(fakeAppData, "Zed", "settings.json"), "utf8");
   check(
     "Zed settings 合并且保留注释与既有条目",
@@ -338,8 +342,11 @@ try {
   );
   const reparsed = JSON.parse(zed.replace(/^[ \t]*\/\/.*$/gm, ""));
   check(
-    "Zed 条目为官方 Custom Agent 格式",
-    reparsed.agent_servers.zcode.type === "custom" && reparsed.agent_servers.zcode.command === "node",
+    "Zed 条目为官方 Custom Agent 格式（PATH 裸名 + acp 子命令）",
+    reparsed.agent_servers.zcode.type === "custom" &&
+      reparsed.agent_servers.zcode.command === "zcode-acp" &&
+      reparsed.agent_servers.zcode.args[0] === "acp" &&
+      !JSON.stringify(reparsed.agent_servers.zcode).includes(":\\\\"),
     JSON.stringify(reparsed.agent_servers),
   );
   // 幂等：重复注册不产生重复条目

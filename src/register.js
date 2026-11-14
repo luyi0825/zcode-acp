@@ -4,15 +4,15 @@
 // 写进各客户端的发现位置——OpenIdea 扫 agents/ 目录放 toml 即现，Zed 读
 // settings.json 的 agent_servers。新增客户端支持 = 在 CLIENTS 注册表加一段
 // 检测 + 写入器，bridge 本体不感知。
+//
+// 命令一律写裸名 "zcode-acp"（PATH 解析，npm 全局 bin 的标准 shim 三件套
+// .cmd/.sh/.ps1 由 npm 生成）：配置里不出现任何用户路径，可原样分享/迁移，
+// 也与 Zed 官方 Custom Agent 文档的形态一致（command: "pool", args: ["acp"]）。
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
-/** 本 CLI 的入口路径：从本模块位置推导（src/register.js → bin/cli.js），
- * 全局安装与本地运行都指对，不依赖 PATH/PATHEXT。 */
-export function cliEntryPath() {
-  return fileURLToPath(new URL("../bin/cli.js", import.meta.url));
-}
+/** 客户端拉起本 agent 的统一命令（裸名，PATH 解析）。 */
+const AGENT_COMMAND = "zcode-acp";
 
 /**
  * 把环境值限定在指定父目录内的绝对路径（拼接固定文件名）。
@@ -28,13 +28,13 @@ function safeJoin(parentDir, ...segments) {
  * OpenIdea：agents/ 目录放 toml 即被扫描（实测）。
  * 文件内容是唯一事实源，重复运行覆盖为当前正确配置（幂等）。
  */
-function writeOpenIdea(appDataDir, cliPath) {
+function writeOpenIdea(appDataDir) {
   const agentsDir = safeJoin(appDataDir, "ai.l0ng.openidea", "agents");
   if (!agentsDir) return `跳过 OpenIdea：目录路径异常`;
   mkdirSync(agentsDir, { recursive: true });
   const toml = safeJoin(agentsDir, "zcode.toml");
   if (!toml) return `跳过 OpenIdea：文件路径异常`;
-  const content = `name = "ZCode"\ncommand = 'node'\nargs = ['${cliPath.replace(/\\/g, "\\\\")}']\n`;
+  const content = `name = "ZCode"\ncommand = '${AGENT_COMMAND}'\n`;
   writeFileSync(toml, content, "utf8");
   return `OpenIdea 已注册（${toml}）`;
 }
@@ -47,15 +47,16 @@ function writeOpenIdea(appDataDir, cliPath) {
  * - 已有 zcode 条目则跳过（幂等）；无 agent_servers 键时在顶层对象内新增；
  * - 括号计数定位块的闭合位置，不依赖 JSON.parse（注释会挂）。
  */
-function writeZed(appDataDir, cliPath) {
+function writeZed(appDataDir) {
   const settingsPath = safeJoin(appDataDir, "Zed", "settings.json");
   if (!settingsPath || !existsSync(settingsPath)) return `跳过 Zed：settings.json 不存在`;
   const original = readFileSync(settingsPath, "utf8");
   if (/"zcode"\s*:/.test(original)) return `Zed 已有 zcode 条目，跳过`;
 
   // Zed 官方 Custom Agent 格式（zed.dev/docs/ai/external-agents）：type: "custom"
-  // 标记非 registry 来源，command/args 指向本 CLI。
-  const entry = `"zcode": { "type": "custom", "command": "node", "args": [${JSON.stringify(cliPath)}] }`;
+  // 标记非 registry 来源；command 为裸名走 PATH（官方 Poolside 示例同款），
+  // args 的 "acp" 是 ACP 生态的约定入口子命令。
+  const entry = `"zcode": { "type": "custom", "command": "${AGENT_COMMAND}", "args": ["acp"] }`;
   const keyIndex = original.indexOf('"agent_servers"');
   let updated;
   if (keyIndex < 0) {
@@ -119,12 +120,11 @@ const CLIENTS = [
  * @param {string} appDataDir 配置根目录（Windows 为 %APPDATA%）
  */
 export function registerAllClients(appDataDir) {
-  const cliPath = cliEntryPath();
   const results = [];
   for (const client of CLIENTS) {
     if (!client.detect(appDataDir)) continue;
     try {
-      results.push(`[ok] ${client.write(appDataDir, cliPath)}`);
+      results.push(`[ok] ${client.write(appDataDir)}`);
     } catch (err) {
       results.push(`[fail] ${client.name}: ${err instanceof Error ? err.message : String(err)}`);
     }
