@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { findModel, listModels, writeSelectionConfig } from "../src/models.js";
-import { createSemanticStream, effortLevelsForModel, reasoningLevelForEffort } from "../src/claude.js";
+import { createSemanticStream, effortLevelsForModel, reasoningLevelForEffort, usageOf } from "../src/claude.js";
 import { readRuntimeEnvFile } from "../src/runtime-env.js";
 import { applyZcodeRuntimeEnv } from "../src/zcode.js";
 
@@ -297,6 +297,56 @@ test("semanticStreamIgnoresEventsWithoutToolCallId", () => {
   assert.equal(stream.consume({ type: "tool.updated", payload: { kind: "scheduled" } }), null);
   assert.equal(stream.consume({ type: "session.updated", payload: {} }), null);
   assert.equal(stream.produced(), false);
+});
+
+test("usageOfTranslatesZcodeUsageToClaudeFields", () => {
+  // zcode 的 usage 是 JSON 字符串，字段驼峰；宿主按 Claude 的 snake_case 累加。
+  // zcode 的 inputTokens 含缓存，Claude 的 input_tokens 不含，故需扣减。
+  const usage = usageOf({
+    type: "session.updated",
+    payload: {
+      usage: JSON.stringify({ inputTokens: 27743, outputTokens: 201, cacheReadTokens: 19200 }),
+    },
+  });
+  assert.deepEqual(usage, {
+    input_tokens: 8543,
+    output_tokens: 201,
+    cache_read_input_tokens: 19200,
+  });
+  // 已解析成对象时同样接受。
+  assert.deepEqual(usageOf({ type: "session.updated", payload: { usage: { inputTokens: 5, outputTokens: 1 } } }), {
+    input_tokens: 5,
+    output_tokens: 1,
+  });
+  // 缓存大于输入（异常数据）时 input 归零而不是负数。
+  assert.deepEqual(
+    usageOf({ type: "session.updated", payload: { usage: { inputTokens: 10, cacheReadTokens: 99 } } }),
+    { input_tokens: 0, cache_read_input_tokens: 99 },
+  );
+  // 无 usage / 非法 JSON / 非 session.updated 一律返回 null，不能中断执行。
+  assert.equal(usageOf({ type: "session.updated", payload: {} }), null);
+  assert.equal(usageOf({ type: "session.updated", payload: { usage: "{bad" } }), null);
+  assert.equal(usageOf({ type: "model.streaming", payload: { usage: "{}" } }), null);
+  assert.equal(usageOf({ type: "session.updated", payload: { usage: { inputTokens: -1 } } }), null);
+});
+
+// 一个 turn 内多次模型请求各自计费：inputTokens 是每次请求的完整输入，必须累加。
+// 这是 result.usage 的上报口径，漏加会让用量严重偏低。
+test("usageOfAccumulatesPerRequest", () => {
+  const total = [
+    { inputTokens: 27743, outputTokens: 201, cacheReadTokens: 19200 },
+    { inputTokens: 28612, outputTokens: 366, cacheReadTokens: 27648 },
+  ].reduce((sum, body) => {
+    const usage = usageOf({ type: "session.updated", payload: { usage: JSON.stringify(body) } });
+    const merged = { ...sum };
+    for (const [key, value] of Object.entries(usage)) merged[key] = (merged[key] ?? 0) + value;
+    return merged;
+  }, {});
+  assert.deepEqual(total, {
+    input_tokens: 9507,
+    output_tokens: 567,
+    cache_read_input_tokens: 46848,
+  });
 });
 
 test("configurationPathsRejectParentTraversal", (t) => {

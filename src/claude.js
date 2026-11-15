@@ -86,6 +86,57 @@ function emit(event) {
 // 单条工具结果上限：Bash 动辄几十 KB 输出，整段推给宿主会撑爆消息体。
 const MAX_TOOL_RESULT = 20000;
 
+// zcode 的 usage 用驼峰，宿主（MiCO Claude 适配器）按 Claude Code 的 snake_case 累加 token。
+// reasoning 是 output 的子集，单列会被重复计费，故不映射；inputTokens 需扣缓存，单列处理。
+const USAGE_FIELDS = {
+  outputTokens: "output_tokens",
+  cacheReadTokens: "cache_read_input_tokens",
+  cacheWriteTokens: "cache_creation_input_tokens",
+};
+
+/** 累加两份 usage；逐字段相加，缺失字段按 0 处理。 */
+function addUsage(base, extra) {
+  const sum = { ...(base ?? {}) };
+  for (const [key, value] of Object.entries(extra)) {
+    sum[key] = (sum[key] ?? 0) + value;
+  }
+  return sum;
+}
+
+/**
+ * 取一次模型请求的 token 用量。
+ *
+ * 规则：
+ * - zcode 每次请求结束发一条 session.updated，payload.usage 是 JSON 字符串而非对象；
+ * - 该次 inputTokens 是这次请求的完整输入，属于独立计费量，多次请求需累加；
+ * - zcode 的 inputTokens **含缓存**（inputTokenDetails = noCache + cacheRead + cacheWrite），
+ *   而 Claude 的 input_tokens 不含缓存，故扣减后上报，避免宿主把缓存重复计入；
+ * - 无 usage、parse 失败或值非法时返回 null，不阻断执行。
+ */
+export function usageOf(event) {
+  if (event?.type !== "session.updated") return null;
+  const raw = event.payload?.usage;
+  if (raw == null) return null;
+  let usage;
+  try {
+    usage = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch {
+    return null;
+  }
+  if (!usage || typeof usage !== "object") return null;
+  const fields = {};
+  for (const [from, to] of Object.entries(USAGE_FIELDS)) {
+    const value = Number(usage[from]);
+    if (Number.isFinite(value) && value >= 0) fields[to] = value;
+  }
+  const input = Number(usage.inputTokens);
+  if (Number.isFinite(input) && input >= 0) {
+    const cached = (fields.cache_read_input_tokens ?? 0) + (fields.cache_creation_input_tokens ?? 0);
+    fields.input_tokens = Math.max(0, input - cached);
+  }
+  return Object.keys(fields).length > 0 ? fields : null;
+}
+
 // 语义事件保活间隔：宿主按「距上次语义事件」判活（实测预算 10 分钟），
 // 纯文本长任务不产生工具事件，需要定期把已累积文本作为一段发出。
 const SEMANTIC_KEEPALIVE_MS = 60_000;
@@ -380,6 +431,9 @@ export async function startClaude(args) {
     const commandText = rewriteSkillCommand(text, await knownNames());
     const startedAt = Date.now();
     const semantics = createSemanticStream();
+    // zcode 每次模型请求发一条带 usage 的 session.updated；该次 inputTokens 是这次请求的
+    // 完整输入，多次请求各自计费，整轮累加才是这轮真实消耗（结果的 usage 上报口径）。
+    let usage;
     // 保活：长任务在两次工具调用之间可能长时间没有语义事件，宿主会判死。
     const keepalive = setInterval(() => {
       emitSemantic(sessionId, options.model, semantics.flush());
@@ -399,6 +453,8 @@ export async function startClaude(args) {
           sessionId = event.sessionId;
           emitInit();
         }
+        const turnUsage = usageOf(event);
+        if (turnUsage) usage = addUsage(usage, turnUsage);
         emitSemantic(sessionId, options.model, semantics.consume(event));
       },
     }).finally(() => clearInterval(keepalive));
@@ -423,6 +479,8 @@ export async function startClaude(args) {
       session_id: sessionId,
       duration_ms: Date.now() - startedAt,
       num_turns: 1,
+      // 宿主按 Claude Code 的 result.usage 兜底累加 token 用量；缺失时不写该字段。
+      ...(usage ? { usage } : {}),
     });
     if (result.error) process.exitCode = 1;
   } catch (error) {
