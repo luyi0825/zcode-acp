@@ -88,31 +88,31 @@ provider 配置副本**（临时目录，随机文件名）喂给子进程——
 已知限制：选择存在 zcode-acp 进程内存里，zcode-acp 重启后回到默认值，客户端重选一次即可；
 同一会话内多轮续接（`--resume`）保持选中项。
 
-### 在 MiCO 上启用思考级别
+### 在 Mutica 上启用思考级别
 
-MiCO 通过「自定义 runtime profile」接入 zcode-acp，**profile 的 protocol family
+Mutica 通过「自定义 runtime profile」接入 zcode-acp，**profile 的 protocol family
 决定思考级别是否可用**（实测 0.6.216）：
 
 - `kimi`：无思考级别支持，界面上不出现选择入口；
 - `acp`：当前服务端模型发现执行器未接入（报 `unknown agent type: "acp"`）；
 - `qoder`：ACP 任务可以执行，但原生模型目录不提供思考档位，界面仍无选择入口；
 - `claude`：**推荐**。zcode-acp 兼容 Claude `stream-json`，并在模型发现
-  `control_request/initialize` 中按模型声明支持的 effort，MiCO 与 ZCode 使用同名
+  `control_request/initialize` 中按模型声明支持的 effort，Mutica 与 ZCode 使用同名
   档位；仅含 `disabled / enabled` 等开关型配置的模型不显示强度滑块。
 
 注册示例（protocol family 创建后不可改，换族需删 profile 重建并把 agent
 `--runtime-id` 换绑到新 runtime）：
 
 ```bash
-mico runtime profile create --command-name zcode-acp --display-name "ZCode ACP (Claude)" \
+mutica runtime profile create --command-name zcode-acp --display-name "ZCode ACP (Claude)" \
   --protocol-family claude
 # 等 daemon 注册出 runtime 后：
-mico runtime list --output json        # 拿到 runtime_id
-mico agent create --name "本地zcode" --runtime-id <runtime_id> \
+mutica runtime list --output json        # 拿到 runtime_id
+mutica agent create --name "本地zcode" --runtime-id <runtime_id> \
   --model "<provider_id>::<model_id>" --thinking-level high
 ```
 
-MiCO 的模型列表来自 ZCode 的 personal provider config，`<provider_id>::<model_id>`
+Mutica 的模型列表来自 ZCode 的 personal provider config，`<provider_id>::<model_id>`
 会真正选中对应模型，不只是协议标签。验证生效模型与级别可看
 `%TEMP%/zcode-acp-provider-*.json` 中的 `modelOrder[0]` 和
 `optionSpecs.reasoningLevel.values` 末位。

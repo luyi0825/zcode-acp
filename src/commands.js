@@ -118,7 +118,7 @@ async function discoverOnce() {
  * 规则：
  * - 自定义命令以 `/<name>` 出现；
  * - 技能也进这个菜单（`/<name>` 形式）：ACP 客户端只会展示这份清单里的条目，
- *   不放进来用户在 OpenIdea / Zed / MiCO 里根本看不到技能，也就无从调用；
+ *   不放进来用户在 OpenIdea / Zed / Mutica 里根本看不到技能，也就无从调用；
  *   实测 `/技能名` 裸写会被 zcode 判为 "Unknown command"，但因为它的 `Skill`
  *   工具在上下文里可用，模型仍会自行加载该技能并执行（见 agent.js 的文本改写）；
  * - 技能排在命令之后（命令是 CLI 原生斜杠项，优先级更高）。

@@ -3,6 +3,8 @@ node_modules/
 build/bundle.cjs
 build/sea-prep.blob
 build/*.exe
+*.tgz
 
 .mimosa
 .openidea
+mydoc

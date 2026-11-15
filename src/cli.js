@@ -17,7 +17,7 @@ function printHelp() {
   zcode-acp setup          自检 + 认证导出 + 自动注册到本机 ACP 客户端
                            （OpenIdea / Zed，装了哪个注册哪个）
   zcode-acp -p --input-format stream-json --effort <level>
-                           MiCO Claude 兼容入口（low / medium / high）
+                           Mutica Claude 兼容入口（low / medium / high）
   zcode-acp --version      输出版本号
 `);
 }
@@ -35,7 +35,7 @@ export async function runCli(argv) {
   }
 
   switch (command) {
-    // MiCO 的 qoder 适配器以 --yolo 启动 ACP；bridge 默认就是 yolo，直接复用服务入口。
+    // Mutica 的 qoder 适配器以 --yolo 启动 ACP；bridge 默认就是 yolo，直接复用服务入口。
     case "--yolo":
     case undefined:
     case "serve":

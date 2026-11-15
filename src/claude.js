@@ -1,4 +1,4 @@
-// MiCO 的 Claude 适配器使用 Claude Code stream-json，而不是 ACP。
+// Mutica 的 Claude 适配器使用 Claude Code stream-json，而不是 ACP。
 // 这里只适配它实际下发的单轮消息、--resume 与 interrupt，执行仍复用 zcode headless。
 import { randomUUID } from "node:crypto";
 import readline from "node:readline";
@@ -10,7 +10,7 @@ import { runTurn } from "./zcode.js";
 
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 
-/** MiCO 与 ZCode 使用同名档位；开关型配置不伪装成强度滑块。 */
+/** Mutica 与 ZCode 使用同名档位；开关型配置不伪装成强度滑块。 */
 export function effortLevelsForModel(reasoningLevels = REASONING_LEVELS) {
   return CLAUDE_EFFORT_LEVELS.filter((level) => reasoningLevels.includes(level));
 }
@@ -54,7 +54,7 @@ function parseArgs(args) {
         index++;
         break;
       case "--permission-mode":
-        // MiCO 固定传 bypassPermissions；保留 plan 的只读语义，其余沿用 headless 默认 yolo。
+        // Mutica 固定传 bypassPermissions；保留 plan 的只读语义，其余沿用 headless 默认 yolo。
         options.mode = value === "plan" ? "plan" : "yolo";
         index++;
         break;
@@ -116,7 +116,7 @@ function discoveryModels() {
 }
 
 /**
- * 把本地命令 / 技能 / 子 agent 转成 MiCO 侧的清单。
+ * 把本地命令 / 技能 / 子 agent 转成 Mutica 侧的清单。
  *
  * 规则：
  * - 自定义命令按 `/<name>` 暴露：它们的调用形式就是裸斜杠命令；
@@ -144,7 +144,7 @@ async function capabilityPayload() {
   }
 }
 
-// MiCO 模型发现只读 control_response 里的模型能力，不应触发真实模型调用。
+// Mutica 模型发现只读 control_response 里的模型能力，不应触发真实模型调用。
 async function emitDiscoveryResponse(requestId) {
   const { commands, agents } = await capabilityPayload();
   emit({
@@ -217,7 +217,7 @@ function readPrompt(onInterrupt) {
   return { input, lines, sessionId: () => sessionId };
 }
 
-/** 启动 MiCO 所需的 Claude Code stream-json 兼容入口。 */
+/** 启动 Mutica 所需的 Claude Code stream-json 兼容入口。 */
 export async function startClaude(args) {
   loadDefaultRuntimeEnv();
   const options = parseArgs(args);
@@ -257,7 +257,7 @@ export async function startClaude(args) {
     let model = null;
     if (selection) model = { ...selection, reasoningLevel };
     else if (reasoningLevel) model = { reasoningLevel };
-    // MiCO 下发的 `/技能名` 要改写成 `/skill 技能名`：裸写会被 CLI 判为未知命令。
+    // Mutica 下发的 `/技能名` 要改写成 `/skill 技能名`：裸写会被 CLI 判为未知命令。
     const commandText = rewriteSkillCommand(text, await knownNames());
     const startedAt = Date.now();
     const result = await runTurn({

@@ -79,7 +79,7 @@ function startClient(args = []) {
   };
 }
 
-// 以 MiCO 的 Claude 参数启动一轮，收集 stream-json 事件直到进程退出。
+// 以 Mutica 的 Claude 参数启动一轮，收集 stream-json 事件直到进程退出。
 function runClaude(args, message) {
   const child = spawn(process.execPath, [BRIDGE, ...args], { cwd, stdio: ["pipe", "pipe", "pipe"] });
   const events = [];
@@ -124,14 +124,14 @@ try {
   check("initialize 返回 protocolVersion", init.protocolVersion === 1, JSON.stringify(init));
   check("initialize 声明 agentInfo.name", init.agentInfo?.name === "zcode-acp");
 
-  // MiCO qoder 适配器会在启动命令前加 --yolo，必须先能完成 ACP 握手。
+  // Mutica qoder 适配器会在启动命令前加 --yolo，必须先能完成 ACP 握手。
   const qoderClient = startClient(["--yolo"]);
   try {
     const qoderInit = await qoderClient.request("initialize", {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
     });
-    check("MiCO qoder --yolo 启动兼容", qoderInit.protocolVersion === 1, qoderClient.stderr());
+    check("Mutica qoder --yolo 启动兼容", qoderInit.protocolVersion === 1, qoderClient.stderr());
   } finally {
     qoderClient.kill();
   }
@@ -518,7 +518,7 @@ try {
     ),
     JSON.stringify(toolUpdates.filter((u) => String(u.sessionUpdate).startsWith("tool")).slice(0, 3)),
   );
-  // 15. MiCO Claude 协议：真实启动参数 → init / assistant / result，并校验档位映射。
+  // 15. Mutica Claude 协议：真实启动参数 → init / assistant / result，并校验档位映射。
   const claudeModelId = models.availableModels?.[1]?.modelId ?? firstModel?.modelId ?? "claude-sonnet-4-6";
   const claudeRun = await runClaude(
     [
@@ -563,10 +563,10 @@ try {
       reasoningLevelForEffort("high") === "high" &&
       reasoningLevelForEffort("max") === "max",
   );
-  // 16. MiCO 模型发现走 control_request/initialize，不启动真实模型调用。
+  // 16. Mutica 模型发现走 control_request/initialize，不启动真实模型调用。
   const discoveryRun = await runClaude(
     ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--no-session-persistence"],
-    { type: "control_request", request_id: "mico-model-discovery", request: { subtype: "initialize" } },
+    { type: "control_request", request_id: "mutica-model-discovery", request: { subtype: "initialize" } },
   );
   const discoveryResponse = discoveryRun.events.find((event) => event.type === "control_response");
   const discoveryModels = discoveryResponse?.response?.response?.models;
@@ -577,7 +577,7 @@ try {
   check(
     "Claude 模型发现按模型返回思考能力",
     discoveryRun.code === 0 &&
-      discoveryResponse?.response?.request_id === "mico-model-discovery" &&
+      discoveryResponse?.response?.request_id === "mutica-model-discovery" &&
       discoveryModels?.[0]?.supportedEffortLevels?.join(",") === expectedEfforts &&
       discoveryModels?.[0]?.supportsEffort === (expectedEfforts.length > 0),
     JSON.stringify(discoveryRun.events),
@@ -590,8 +590,8 @@ try {
     JSON.stringify(discoveryModels?.map((model) => model.value)),
   );
 
-  // 16b. MiCO 能力清单：命令 + 技能（/skill 前缀形式）+ 子 agent 都要下发，
-  //      否则 MiCO 侧看不到本地能力；技能必须带前缀，裸名在 zcode 里是 Unknown command。
+  // 16b. Mutica 能力清单：命令 + 技能（/skill 前缀形式）+ 子 agent 都要下发，
+  //      否则 Mutica 侧看不到本地能力；技能必须带前缀，裸名在 zcode 里是 Unknown command。
   const discoveryCommands = discoveryResponse?.response?.response?.commands ?? [];
   const discoveryAgents = discoveryResponse?.response?.response?.agents ?? [];
   check(
@@ -601,7 +601,7 @@ try {
     JSON.stringify(discoveryCommands.slice(0, 3)),
   );
   check(
-    "技能以斜杠形式暴露（供 MiCO 点选）",
+    "技能以斜杠形式暴露（供 Mutica 点选）",
     discoveryCommands.some((c) => c.name.startsWith("/")),
     JSON.stringify(discoveryCommands.filter((c) => c.name.startsWith("/")).slice(0, 2)),
   );
@@ -641,7 +641,7 @@ try {
     new Set(slashCommands.map((c) => c.name)).size === slashCommands.length,
   );
 
-  // 17b. 技能必须进客户端菜单（否则 OpenIdea / Zed / MiCO 里根本看不到、点不到），
+  // 17b. 技能必须进客户端菜单（否则 OpenIdea / Zed / Mutica 里根本看不到、点不到），
   //      且技能名改写要遵守「同名命令优先」——cross-cr 既是命令又是技能，
   //      改成 /skill 会绕过命令自带上下文。
   const capabilityNames = await (async () => {

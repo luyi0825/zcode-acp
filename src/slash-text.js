@@ -2,7 +2,7 @@
 //
 // 背景：zcode 的斜杠注册表只含自定义命令，技能不在其中（实测裸写 `/技能名`
 // 得到 "Unknown command"）。技能要靠 CLI 的 `/skill <name>` 子命令加载，
-// 因此 bridge 在两个入口（ACP 的 session/prompt 与 MiCO 的 Claude 入口）
+// 因此 bridge 在两个入口（ACP 的 session/prompt 与 Mutica 的 Claude 入口）
 // 统一做这次改写。
 
 // 首行的斜杠命令形式：/名字 后面可跟参数。
