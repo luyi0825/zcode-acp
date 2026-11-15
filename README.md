@@ -13,8 +13,9 @@ bridge 只做协议翻译：ZCode 的 agent 能力（工具、skills、MCP、hoo
 ## 前置条件
 
 1. **ZCode Desktop**（CLI 的发行载体）：[官网](https://zcode.z.ai) 下载安装。
-   安装后**不需要打开它**——CLI 是独立的（`<安装目录>/resources/glm/zcode.cjs`），
-   bridge 按标准安装路径自动定位；自定义安装路径时设 `ZCODE_HOME` 指向安装目录即可。
+   安装后**不需要打开它**——CLI 是独立的（Windows：`<安装目录>/resources/glm/zcode.cjs`；
+   macOS：`<ZCode.app>/Contents/Resources/glm/zcode.cjs`），bridge 按标准安装路径自动定位；
+   自定义安装路径时设 `ZCODE_HOME` 指向安装目录即可。
 2. **Node ≥ 20**（npm 安装与 CLI 运行都需要）。
 
 ## 快速开始
@@ -109,6 +110,7 @@ provider 配置副本**（临时目录，随机文件名）喂给子进程——
 
 ```bash
 npm install
+npm test               # 4 项隔离回归测试（不调用真实模型）
 npm run smoke          # 32 项协议自测（需要本机已登录 zcode）
 ```
 

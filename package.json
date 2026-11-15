@@ -22,6 +22,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "test": "node --test test/regression.test.mjs",
     "smoke": "node test/smoke.mjs"
   },
   "keywords": [

@@ -1,6 +1,7 @@
 // 定位并调用本机 zcode CLI。
-// 背景：zcode CLI 随 ZCode Desktop 发行（安装目录 resources/glm/zcode.cjs），
-// 官方不单独分发、也不在 PATH 上放命令；这里按标准安装路径自适应定位，
+// 背景：zcode CLI 随 ZCode Desktop 发行（Windows 在安装根 resources/glm，
+// macOS 在 app bundle 的 Contents/Resources/glm），官方不单独分发、也不在
+// PATH 上放命令；这里按标准安装路径自适应定位，
 // 用系统 Node 运行。不用安装根里的 Electron 二进制：ELECTRON_RUN_AS_NODE
 // 模式下实测拿不到完整凭据环境（provider 401）。
 import { spawn } from "node:child_process";
@@ -13,6 +14,7 @@ const WIN = process.platform === "win32";
 
 // ZCode 安装根下的固定相对路径，可执行文件只能从这里派生。
 const CLI_RELATIVE = path.join("resources", "glm", "zcode.cjs");
+const MACOS_CLI_RELATIVE = path.join("Contents", "Resources", "glm", "zcode.cjs");
 
 // zcode 支持的权限模式（--mode 的合法取值，与 CLI 帮助一致）。
 // 白名单双重防线：agent 层校验后，这里在 spawn 前再校验一次，
@@ -51,52 +53,41 @@ function isFile(p) {
   return Boolean(p) && existsSync(p) && statSync(p).isFile();
 }
 
-/** 只认已存在的目录。 */
-function isDir(p) {
-  return Boolean(p) && existsSync(p) && statSync(p).isDirectory();
-}
-
-/**
- * 数据目录候选：zcode 的凭据与 provider 配置都在这里。
- * 规则：优先用已有的 ZCODE_DATA_BASE_DIR（ZCode Desktop 注入），
- * 否则从本进程可见的环境推断，最后回退 <用户主目录>。
- */
-function dataBaseDirs() {
-  const dirs = [];
-  if (process.env.ZCODE_DATA_BASE_DIR) dirs.push(process.env.ZCODE_DATA_BASE_DIR);
-  const home = process.env.USERPROFILE ?? process.env.HOME;
-  if (home) dirs.push(path.join(home, ".zcode"));
-  return dirs.filter((d) => typeof d === "string" && path.isAbsolute(d));
-}
-
 /**
  * 补齐 zcode 运行所需的运行时环境。
  *
  * 规则：
- * - ZCODE_DATA_BASE_DIR 是认证的关键：缺了它 zcode 会去默认位置找凭据，
- *   被其它宿主拉起时表现为 provider 401 "API Key 不存在"。
- * - 只在未设置时补齐，不覆盖调用方显式给的值。
+ * - env-file 与调用方显式值优先；builtin provider config 未设置时才按安装根兜底；
+ * - 不默认注入 ZCODE_DATA_BASE_DIR：它替代的是 homedir，而非 ~/.zcode，
+ *   显式设置还会切入受管模式；Desktop 重定向场景仍由 env-file 提供。
  *
  * 导出供 login 代理复用（login.js）：与 runTurn 用同一套定位与环境准备。
+ * @param {string} [cli] 已解析的 zcode.cjs 路径，用于定位实际安装根。
  */
-export function applyZcodeRuntimeEnv(env) {
+export function applyZcodeRuntimeEnv(env, cli) {
   // Desktop 的认证上下文由使用方导出成 env-file（见 runtime-env.js）。
   mergeRuntimeEnv(env, process.env.ZCODE_ACP_ENV_FILE);
-  if (!env.ZCODE_DATA_BASE_DIR) {
-    const dir = dataBaseDirs().find(isDir);
-    if (dir) env.ZCODE_DATA_BASE_DIR = dir;
+  if (cli && !env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE) {
+    // 从 CLI 反推实际安装根，兼容 macOS 的 <bundle>/Contents 布局。
+    const installRoot = path.resolve(path.dirname(cli), "..", "..");
+    const config = path.join(installRoot, "config", "provider", "zcode-builtin.json");
+    if (isFile(config)) env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = config;
   }
 }
 
 /**
  * 解析出可执行的 (node, cli) 组合。
  * 规则：
- * - cli 固定为 <安装根>/resources/glm/zcode.cjs，必须真实存在；
+ * - cli 固定为安装根下的平台对应路径，必须真实存在；
+ * - macOS 优先标准 Contents/Resources 布局，回退裸 bundle 的 resources 布局；
  * - node 固定为字面量 "node"（交给 PATH 解析）。
  */
 export function resolveZcode() {
   const roots = installRoots();
-  const cli = roots.map((root) => path.join(root, CLI_RELATIVE)).find(isFile);
+  const relativeCliPaths = WIN ? [CLI_RELATIVE] : [MACOS_CLI_RELATIVE, CLI_RELATIVE];
+  const cli = roots
+    .flatMap((root) => relativeCliPaths.map((relative) => path.join(root, relative)))
+    .find(isFile);
   if (!cli) {
     throw new Error(
       "找不到 zcode.cjs。请先安装 ZCode Desktop（zcode CLI 随其发行），" +
@@ -181,10 +172,7 @@ export function runTurn({ cwd, text, resume, mode, model, onStart, onEvent }) {
   const safeMode = MODES.has(mode) ? mode : "yolo";
 
   const env = { ...process.env };
-  // 被其它宿主拉起时不继承 ZCode Desktop 的运行时环境：缺 ZCODE_DATA_BASE_DIR 会去
-  // 错误的目录找凭据，缺 ZCODE_OFFICIAL_ENDPOINT 拿不到认证管道，表现为
-  // provider 401 "API Key 不存在"。这里从配置补齐（见 applyZcodeRuntimeEnv）。
-  applyZcodeRuntimeEnv(env);
+  applyZcodeRuntimeEnv(env, cli);
   if (model) {
     // 在 merge 之后覆盖，确保副本一定生效（mergeRuntimeEnv 不覆盖已有值）。
     // 生成失败（配置被删/损坏）时沿用原配置，zcode 用其默认模型。
