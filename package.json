@@ -23,6 +23,7 @@
   ],
   "scripts": {
     "release": "bash build/release.sh",
+    "test": "node --test test/regression.test.mjs",
     "smoke": "node test/smoke.mjs"
   },
   "keywords": [

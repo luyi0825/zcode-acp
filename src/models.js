@@ -168,6 +168,7 @@ export function writeSelectionConfig(selection) {
         modelRules.push(modelRule);
       }
       modelRule.config.optionSpecs = {
+        ...modelRule.config.optionSpecs,
         reasoningLevel: {
           values: [
             ...REASONING_LEVELS.filter((level) => level !== selection.reasoningLevel),

@@ -16,7 +16,7 @@ import { applyZcodeRuntimeEnv, resolveZcode } from "./zcode.js";
 function runProxyCommand(extraArgs) {
   const { node, cli } = resolveZcode();
   const env = { ...process.env };
-  applyZcodeRuntimeEnv(env);
+  applyZcodeRuntimeEnv(env, cli);
 
   return new Promise((resolve) => {
     const child = spawn(node, [cli, ...extraArgs], {
