@@ -1,6 +1,7 @@
 // CLI 命令分发：bin/cli.js（npm 形态）与 build/sea-entry.js（单文件 exe 形态）
 // 共用的入口，保证两种形态行为一致。
 import { AGENT_INFO, startAgent } from "./agent.js";
+import { startClaude } from "./claude.js";
 import { execLogin, execLoginNoBrowser, execLogout } from "./login.js";
 import { runDoctor, runSetup } from "./doctor.js";
 
@@ -15,6 +16,8 @@ function printHelp() {
   zcode-acp doctor         安装自检（--probe 实跑一轮验证）
   zcode-acp setup          自检 + 认证导出 + 自动注册到本机 ACP 客户端
                            （OpenIdea / Zed，装了哪个注册哪个）
+  zcode-acp -p --input-format stream-json --effort <level>
+                           MiCO Claude 兼容入口（low / medium / high）
   zcode-acp --version      输出版本号
 `);
 }
@@ -25,6 +28,11 @@ function printHelp() {
  */
 export async function runCli(argv) {
   const [command, ...rest] = argv.slice(2);
+
+  if (command === "-p" && rest[rest.indexOf("--input-format") + 1] === "stream-json") {
+    await startClaude(argv.slice(2));
+    return;
+  }
 
   switch (command) {
     // MiCO 的 qoder 适配器以 --yolo 启动 ACP；bridge 默认就是 yolo，直接复用服务入口。

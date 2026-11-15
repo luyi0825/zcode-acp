@@ -89,32 +89,37 @@ provider 配置副本**（临时目录，随机文件名）喂给子进程——
 MiCO 通过「自定义 runtime profile」接入本 bridge，**profile 的 protocol family
 决定思考级别是否可用**（实测 0.6.216）：
 
-- `kimi`：无思考级别支持。服务端拒绝任何取值（`thinking_level "high" is not
-  a recognised value for runtime "kimi"`），界面上不出现选择入口；
-- `acp`：当前服务端模型发现执行器未接入（报 `unknown agent type: "acp"`），
-  模型列表拿不到；
-- `qoder`：**全链路可用**。`mico agent create/update --thinking-level low|high|max`
-  经 daemon 的 qoder 适配器转成对 bridge 的 ACP 配置调用，bridge 写入 provider
-  配置副本（验证方式：`%TEMP%/zcode-acp-provider-*.json` 里
-  `optionSpecs.reasoningLevel.values` 末位即生效级别）。
+- `kimi`：无思考级别支持，界面上不出现选择入口；
+- `acp`：当前服务端模型发现执行器未接入（报 `unknown agent type: "acp"`）；
+- `qoder`：ACP 任务可以执行，但原生模型目录不提供思考档位，界面仍无选择入口；
+- `claude`：**推荐**。bridge 兼容 Claude `stream-json`，并在模型发现
+  `control_request/initialize` 中声明 `low / medium / high`，MiCO 据此显示滑块。
+  三档依次映射到 ZCode 的 `low / high / max`。
 
 注册示例（protocol family 创建后不可改，换族需删 profile 重建并把 agent
 `--runtime-id` 换绑到新 runtime）：
 
 ```bash
-mico runtime profile create --command-name zcode-acp --display-name "ZCode ACP" \
-  --protocol-family qoder
+mico runtime profile create --command-name zcode-acp --display-name "ZCode ACP (Claude)" \
+  --protocol-family claude
 # 等 daemon 注册出 runtime 后：
 mico runtime list --output json        # 拿到 runtime_id
 mico agent create --name "本地zcode" --runtime-id <runtime_id> \
-  --thinking-level high                # 也可创建后 update
+  --model "<provider_id>::<model_id>" --thinking-level high
 ```
+
+MiCO 的模型列表来自 ZCode 的 personal provider config，`<provider_id>::<model_id>`
+会真正选中对应模型，不只是协议标签。验证生效模型与级别可看
+`%TEMP%/zcode-acp-provider-*.json` 中的 `modelOrder[0]` 和
+`optionSpecs.reasoningLevel.values` 末位。
 
 ## 工作方式
 
 - 每轮 prompt 独立 spawn `zcode -p --output-format stream-json --mode yolo`，
   多轮上下文由 `--resume <sessionId>` 续接；
 - 提示词以 `--prompt=<text>` 等号形式传入，客户端输入不可能被解析成 CLI 选项；
+- ACP 图片（PNG / JPEG / GIF / WebP）写为本轮临时文件，由 zcode `Read` 读取，
+  prompt 结束后删除临时目录；
 - **权限模式**：客户端可通过 `session/set_mode` 选择 plan（只读）/ build / edit /
   guarded / yolo，映射到 zcode 原生 `--mode`；默认 yolo（headless 无确认入口，
   任务会无确认读写文件、执行命令，只接入你信任的客户端），需要受控执行时切
@@ -136,7 +141,7 @@ mico agent create --name "本地zcode" --runtime-id <runtime_id> \
 
 ```bash
 npm install
-npm test               # 4 项隔离回归测试（不调用真实模型）
+npm test               # 5 项隔离回归测试（不调用真实模型）
 npm run smoke          # 协议自测（需要本机已登录 zcode）
 npm run release        # 本机一键发布：构建 exe → 部署到 ~/.local/bin → 自检
 ```

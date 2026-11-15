@@ -1,17 +1,31 @@
 // ZCode ACP agent：把本机 zcode CLI 包装成 ACP v1 agent，
 // 让 Zed / Neovim / OpenIdea 这类 ACP 客户端把 ZCode 当作编码 agent 使用。
 import { Readable, Writable } from "node:stream";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
 import { runTurn } from "./zcode.js";
 import { eventToUpdates } from "./map-event.js";
-import { attachClient, emitText, emitUpdate } from "./emitter.js";
+import { attachClient, emitAvailableCommands, emitText, emitUpdate } from "./emitter.js";
+import { discoverCapabilities, listSlashCommands } from "./commands.js";
+import { rewriteSkillCommand } from "./slash-text.js";
 import { loadDefaultRuntimeEnv } from "./runtime-env.js";
 import { encodeModelId, findModel, isKnownReasoningLevel, listModels, REASONING_LEVELS } from "./models.js";
 
 export const AGENT_INFO = { name: "zcode-acp", title: "ZCode", version: "0.5.3" };
+
+// 认证方式声明：ACP Registry 校验 authMethods 非空，空数组会让上架 CI 直接拒绝。
+// 凭据由 zcode CLI 自己持有（login / Desktop 签发），客户端无需提供任何东西，
+// 因此这里只做「已就绪」宣告，authenticate 不读取参数。
+const AUTH_METHODS = [
+  {
+    id: "zcode-credentials",
+    name: "ZCode 登录态",
+    description: "凭据来自 zcode CLI（zcode-acp login 或 ZCode Desktop 签发），无需在客户端填写",
+  },
+];
 
 // 权限模式：id 沿用 zcode 原生枚举（--mode 的合法取值），跨端语义一致。
 // 默认 yolo：headless 没有确认入口，与 zcode 对 --prompt 的默认一致；
@@ -50,16 +64,29 @@ function normalizeCwd(cwd) {
   return process.env.USERPROFILE ?? process.env.HOME ?? process.cwd();
 }
 
+// zcode Read 工具支持的图片格式；固定扩展名避免 MIME 输入进入文件路径。
+const IMAGE_EXTENSIONS = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+};
+
 /**
- * 把 prompt 内容块拼成一段文本。
- * shortcut: 只取 text 块；本 agent 在 initialize 里已声明不支持 image/audio/embeddedContext，
- * 客户端不应下发其他块类型。
+ * 把 prompt 的文本与图片拆成 CLI 输入；纯图片消息补一条提示，避免被空文本检查跳过。
+ * audio / embeddedContext 仍未声明支持，不下发给 CLI。
  */
-function promptText(blocks) {
-  return (blocks ?? [])
+function promptContent(blocks) {
+  const content = blocks ?? [];
+  const text = content
     .filter((block) => block.type === "text" && typeof block.text === "string")
     .map((block) => block.text)
     .join("\n");
+  const images = content
+    .filter((block) => block.type === "image")
+    .map((block) => ({ data: block.data, mimeType: block.mimeType }));
+  if (!text.trim() && images.length > 0) return { text: "请分析所附图片。", images };
+  return { text, images };
 }
 
 /**
@@ -82,8 +109,8 @@ function modelsPayload(record) {
   };
 }
 
-// ACP 新版用 configOptions 声明可调选项；旧版字段（models/modes）与之并存，
-// 客户端优先读 configOptions。多数客户端把 id "reasoning" 归类为思考级别。
+// ACP 新版用 configOptions 声明可调选项；旧版字段（models/modes）与之并存。
+// category=thought_level 是客户端识别思考档位的语义标记，不能只靠自定义 id。
 const REASONING_OPTION_ID = "reasoning";
 const REASONING_NAMES = { low: "低", high: "高", max: "最大" };
 
@@ -109,11 +136,41 @@ function configOptionsPayload(record) {
       id: REASONING_OPTION_ID,
       name: "思考级别",
       description: "ZCode 的推理深度（reasoningLevel）",
+      category: "thought_level",
       type: "select",
       currentValue: record?.reasoningLevel ?? "max",
       options: REASONING_LEVELS.map((level) => ({ value: level, name: REASONING_NAMES[level] ?? level })),
     },
   ];
+}
+
+/**
+ * 本机已知的命令 / 技能名集合；发现失败返回空集合（此时不改写，按原样下发）。
+ * 与命令菜单共用 discoverCapabilities 的进程级缓存，正常不会重复读 CLI。
+ */
+async function knownNames() {
+  try {
+    const { skills, commands } = await discoverCapabilities();
+    return {
+      skills: new Set(skills.map((skill) => skill.name)),
+      commands: new Set(commands.map((command) => command.name)),
+    };
+  } catch {
+    return { skills: new Set(), commands: new Set() };
+  }
+}
+
+/**
+ * 异步推送斜杠命令菜单；读取失败时推空列表（清掉客户端残留条目）。
+ */
+async function emitSlashCommands(sessionId) {
+  let commands = [];
+  try {
+    commands = await listSlashCommands();
+  } catch {
+    // 命令发现是增强项，失败按空列表处理。
+  }
+  await emitAvailableCommands(sessionId, commands);
 }
 
 /**
@@ -136,10 +193,10 @@ export function startAgent() {
         loadSession: true,
         // 客户端续接任务时会调用 session/resume；不声明会被判为方法不存在。
         sessionCapabilities: { resume: {} },
-        promptCapabilities: { image: false, audio: false, embeddedContext: false },
+        promptCapabilities: { image: true, audio: false, embeddedContext: false },
         mcpCapabilities: { http: false, sse: false },
       },
-      authMethods: [],
+      authMethods: AUTH_METHODS,
       agentInfo: AGENT_INFO,
     }))
     .onRequest("authenticate", () => ({}))
@@ -154,6 +211,9 @@ export function startAgent() {
         stop: null,
       };
       records.push(record);
+      // 命令菜单在响应之后异步推：读命令要起子进程（约百毫秒级），
+      // 同步等待会拖慢每个新会话；菜单晚到不影响会话可用。
+      void emitSlashCommands(record.id);
       return {
         sessionId: record.id,
         models: modelsPayload(record),
@@ -264,16 +324,32 @@ export function startAgent() {
       const record = findRecord(ctx.params.sessionId);
       if (!record) throw acp.RequestError.sessionNotFound(String(ctx.params.sessionId));
 
-      const text = promptText(ctx.params.prompt);
+      const { text, images } = promptContent(ctx.params.prompt);
       if (!text.trim()) return { stopReason: "end_turn" };
 
       // 同一会话串行：并发 prompt 会争抢 zcodeSessionId，先拒绝后者。
       if (record.stop) return { stopReason: "refusal" };
 
+      // 技能名改写要在拼附件说明之前：CLI 只认开头的斜杠命令，拼了后缀就失效。
+      const commandText = rewriteSkillCommand(text, await knownNames());
+
+      const attachmentDir = images.length > 0 ? mkdtempSync(path.join(tmpdir(), "zcode-acp-images-")) : null;
       try {
+        const attachments = images.map((image, index) => {
+          const extension = IMAGE_EXTENSIONS[image.mimeType];
+          if (!extension) throw new Error(`不支持的图片类型：${image.mimeType}；仅支持 PNG/JPEG/GIF/WebP`);
+          const data = Buffer.from(image.data, "base64");
+          if (data.length === 0) throw new Error("图片内容为空");
+          const file = path.join(attachmentDir, `image-${index}${extension}`);
+          writeFileSync(file, data);
+          return file;
+        });
+        const prompt = attachments.length > 0
+          ? `${commandText}\n\n请使用 Read 工具读取以下图片后再回答：\n${attachments.join("\n")}`
+          : commandText;
         const result = await runTurn({
           cwd: record.cwd,
-          text,
+          text: prompt,
           resume: record.zcodeSessionId,
           mode: record.mode ?? DEFAULT_MODE,
           // 思考级别随模型一起进 provider 配置副本（见 models.js）。
@@ -303,6 +379,7 @@ export function startAgent() {
         return { stopReason: "end_turn" };
       } finally {
         record.stop = null;
+        if (attachmentDir) rmSync(attachmentDir, { recursive: true, force: true });
       }
     })
     .onNotification("session/cancel", (ctx) => {

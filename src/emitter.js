@@ -35,3 +35,15 @@ export function emitText(sessionId, text) {
     content: { type: "text", text: clip(text) },
   });
 }
+
+/**
+ * 推送 "/" 菜单。
+ * 规则：一次会话只推一次（客户端整份替换该列表）；命令清单为空时也推，
+ * 让客户端把上一次残留的条目清掉。失败静默——菜单是增强项，不应影响会话。
+ */
+export function emitAvailableCommands(sessionId, availableCommands) {
+  return emitUpdate(sessionId, {
+    sessionUpdate: "available_commands_update",
+    availableCommands,
+  }).catch(() => {});
+}
