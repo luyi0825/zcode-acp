@@ -7,21 +7,25 @@
 ACP 客户端 ──stdio NDJSON (ACP v1)──▶ zcode-acp ──spawn──▶ zcode CLI（headless）
 ```
 
-bridge 只做协议翻译：ZCode 的 agent 能力（工具、skills、MCP、hooks、多轮上下文）
-全部来自随 ZCode Desktop 发行的 CLI 本体，bridge 自动定位并驱动它。
+zcode-acp 只做协议翻译：ZCode 的 agent 能力（工具、skills、MCP、hooks、多轮上下文）
+全部来自随 ZCode Desktop 发行的 CLI 本体，zcode-acp 自动定位并驱动它。
 
 ## 前置条件
 
 1. **ZCode Desktop**（CLI 的发行载体）：[官网](https://zcode.z.ai) 下载安装。
    安装后**不需要打开它**——CLI 是独立的（Windows：`<安装目录>/resources/glm/zcode.cjs`；
-   macOS：`<ZCode.app>/Contents/Resources/glm/zcode.cjs`），bridge 按标准安装路径自动定位；
+   macOS：`<ZCode.app>/Contents/Resources/glm/zcode.cjs`），zcode-acp 按标准安装路径自动定位；
    自定义安装路径时设 `ZCODE_HOME` 指向安装目录即可。
 2. **Node ≥ 20**（npm 安装与 CLI 运行都需要）。
 
 ## 快速开始
 
+安装包为 npm tarball（`luyi0825-zcode-acp-<版本>.tgz`，维护者用 `npm pack` 打包上传）。
+从 [GitHub Releases](https://github.com/luyi0825/zcode-acp/releases) 下载安装包，
+再用 npm 从本地安装：
+
 ```bash
-npm install -g @luyi0825/zcode-acp
+npm install -g ./luyi0825-zcode-acp-<版本>.tgz
 zcode-acp login      # 浏览器授权登录（一次性）
 zcode-acp doctor     # 自检：CLI 定位 / 登录态 / 模型列表
 ```
@@ -61,7 +65,7 @@ command = 'zcode-acp'
    密钥在 OS keyring）。全程不依赖 ZCode Desktop 运行。
 2. **ZCode Desktop 用户（数据目录被重定向）**：在 Desktop 打开的终端里运行
    `zcode-acp setup`，自动把 Desktop 签发的运行时变量导出到
-   `~/.zcode-acp.env`（bridge 启动时默认读取）。Desktop 重启后这些变量会更换，
+   `~/.zcode-acp.env`（zcode-acp 启动时默认读取）。Desktop 重启后这些变量会更换，
    届时重新运行一次 `setup` 即可。
 
 Linux 服务器等无 OS keyring 的环境：设置 `ZCODE_CREDENTIAL_SECRET` 环境变量
@@ -69,11 +73,11 @@ Linux 服务器等无 OS keyring 的环境：设置 `ZCODE_CREDENTIAL_SECRET` �
 
 ## 模型选择、思考级别与权限模式
 
-bridge 在 `session/new` / `session/load` / `session/resume` 里报告真实模型列表
+zcode-acp 在 `session/new` / `session/load` / `session/resume` 里报告真实模型列表
 （来自 ZCode 的 personal provider 配置，按 providerOrder × modelOrder 展开）、
-思考级别选项（`configOptions` 的 `reasoning`：low / high / max）与权限模式
-（`modes`：plan / build / edit / guarded / yolo），客户端的模型选择器、思考级别
-选择器、模式下拉框直接可用。
+按当前模型计算的思考级别选项（`configOptions` 的 `thought_level`）与权限模式
+（`modes`：plan / build / guarded / yolo）。思考档位由 personal 与 builtin
+模型规则合并得出；切换模型后会广播新选项，旧档位不兼容时回到新模型默认档位。
 
 实现背景（实测逆向 zcode CLI 得出）：headless（`-p`）模式没有切换模型/思考级别的
 参数，其默认模型取 provider 配置里 `providerOrder[0]` 的 `modelOrder[0]`，默认
@@ -81,20 +85,20 @@ bridge 在 `session/new` / `session/load` / `session/resume` 里报告真实模�
 与 `session/set_config_option` 的实现是：生成一份把选中项重排到位的**一次性
 provider 配置副本**（临时目录，随机文件名）喂给子进程——认证不受影响。
 
-已知限制：选择存在 bridge 进程内存里，bridge 重启后回到默认值，客户端重选一次即可；
+已知限制：选择存在 zcode-acp 进程内存里，zcode-acp 重启后回到默认值，客户端重选一次即可；
 同一会话内多轮续接（`--resume`）保持选中项。
 
 ### 在 MiCO 上启用思考级别
 
-MiCO 通过「自定义 runtime profile」接入本 bridge，**profile 的 protocol family
+MiCO 通过「自定义 runtime profile」接入 zcode-acp，**profile 的 protocol family
 决定思考级别是否可用**（实测 0.6.216）：
 
 - `kimi`：无思考级别支持，界面上不出现选择入口；
 - `acp`：当前服务端模型发现执行器未接入（报 `unknown agent type: "acp"`）；
 - `qoder`：ACP 任务可以执行，但原生模型目录不提供思考档位，界面仍无选择入口；
-- `claude`：**推荐**。bridge 兼容 Claude `stream-json`，并在模型发现
-  `control_request/initialize` 中声明 `low / medium / high`，MiCO 据此显示滑块。
-  三档依次映射到 ZCode 的 `low / high / max`。
+- `claude`：**推荐**。zcode-acp 兼容 Claude `stream-json`，并在模型发现
+  `control_request/initialize` 中按模型声明支持的 effort，MiCO 与 ZCode 使用同名
+  档位；仅含 `disabled / enabled` 等开关型配置的模型不显示强度滑块。
 
 注册示例（protocol family 创建后不可改，换族需删 profile 重建并把 agent
 `--runtime-id` 换绑到新 runtime）：
@@ -120,8 +124,8 @@ MiCO 的模型列表来自 ZCode 的 personal provider config，`<provider_id>::
 - 提示词以 `--prompt=<text>` 等号形式传入，客户端输入不可能被解析成 CLI 选项；
 - ACP 图片（PNG / JPEG / GIF / WebP）写为本轮临时文件，由 zcode `Read` 读取，
   prompt 结束后删除临时目录；
-- **权限模式**：客户端可通过 `session/set_mode` 选择 plan（只读）/ build / edit /
-  guarded / yolo，映射到 zcode 原生 `--mode`；默认 yolo（headless 无确认入口，
+- **权限模式**：客户端可通过 `session/set_mode` 选择 plan（计划模式）/ build（变更前确认）/
+  guarded（自主模式）/ yolo（完全访问），映射到 zcode 原生 `--mode`；默认 yolo（headless 无确认入口，
   任务会无确认读写文件、执行命令，只接入你信任的客户端），需要受控执行时切
   plan / guarded；
 - stream-json 事件翻译为 ACP 更新：文本/推理增量、工具调用与结果、token 用量；

@@ -15,6 +15,7 @@ function startClient(env, cwd) {
   const args = DEPLOYED_BRIDGE ? [] : [BRIDGE];
   const child = spawn(command, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
   const pending = new Map();
+  const updates = [];
   let nextId = 1;
   let buffer = "";
   let stderr = "";
@@ -29,6 +30,10 @@ function startClient(env, cwd) {
       nl = buffer.indexOf("\n");
       if (!line) continue;
       const message = JSON.parse(line);
+      if (message.method === "session/update") {
+        updates.push(message.params.update);
+        continue;
+      }
       if (message.id === undefined || !pending.has(message.id)) continue;
       const { resolve, reject } = pending.get(message.id);
       pending.delete(message.id);
@@ -42,6 +47,7 @@ function startClient(env, cwd) {
 
   return {
     child,
+    updates,
     stderr: () => stderr,
     request(method, params) {
       return new Promise((resolve, reject) => {
@@ -64,6 +70,18 @@ function startClient(env, cwd) {
       });
     },
   };
+}
+
+async function removeDir(dir) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt === 19) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
 }
 
 test("acpPromptPassesImageToZcodeReadAndCleansUp", async (t) => {
@@ -105,7 +123,7 @@ console.log(JSON.stringify({ sessionId: "image-test", type: "session.updated", p
       client.child.kill();
       await closed;
     }
-    rmSync(dir, { recursive: true, force: true });
+    await removeDir(dir);
   });
 
   const initialized = await client.request("initialize", {
@@ -128,4 +146,114 @@ console.log(JSON.stringify({ sessionId: "image-test", type: "session.updated", p
   assert.equal(path.basename(captured.imagePath), "image-0.png");
   assert.equal(captured.data, PNG_1X1);
   assert.equal(existsSync(path.dirname(captured.imagePath)), false, "临时图片目录应在 prompt 后删除");
+});
+
+test("acpModelSelectionRefreshesReasoningOptions", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "zcode-acp-reasoning-test-"));
+  const installRoot = path.join(dir, "ZCode");
+  const cli = path.join(installRoot, "resources", "glm", "zcode.cjs");
+  const personal = path.join(dir, "personal.json");
+  const builtin = path.join(dir, "builtin.json");
+  mkdirSync(path.dirname(cli), { recursive: true });
+  writeFileSync(
+    cli,
+    `if (process.argv[2] === "commands" || process.argv[2] === "skills") {
+  console.log("{}");
+  process.exit(0);
+}
+process.exit(0);
+`,
+  );
+  writeFileSync(
+    personal,
+    JSON.stringify({
+      config: {
+        providerOrder: ["p1"],
+        providerConfigRules: {
+          providerRules: [{ providerId: "p1", config: { modelOrder: ["alpha", "beta"] } }],
+        },
+        modelConfigRules: { providerModelRules: [] },
+      },
+    }),
+  );
+  writeFileSync(
+    builtin,
+    JSON.stringify({
+      config: {
+        modelConfigRules: {
+          modelRules: [
+            { modelMatch: "alpha", config: { optionSpecs: { reasoningLevel: { values: ["low", "high", "max"] } } } },
+            { modelMatch: "beta", config: { optionSpecs: { reasoningLevel: { values: ["low", "medium", "xhigh"] } } } },
+          ],
+        },
+      },
+    }),
+  );
+
+  const client = startClient(
+    {
+      ...process.env,
+      ZCODE_HOME: installRoot,
+      ZCODE_ACP_ENV_FILE: path.join(dir, "missing.env"),
+      ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: personal,
+      ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: builtin,
+    },
+    dir,
+  );
+  t.after(async () => {
+    if (client.child.exitCode === null && client.child.signalCode === null) {
+      const closed = new Promise((resolve) => client.child.once("close", resolve));
+      client.child.kill();
+      await closed;
+    }
+    await removeDir(dir);
+  });
+
+  await client.request("initialize", {
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+  });
+  const created = await client.request("session/new", { cwd: dir, mcpServers: [] });
+  const sessionId = created.sessionId;
+  const initialOption = created.configOptions.find((option) => option.id === "thought_level");
+  assert.equal(initialOption.currentValue, "max");
+  assert.deepEqual(initialOption.options.map((option) => option.value), ["low", "high", "max"]);
+  assert.ok(created.models.availableModels.every((model) => !Object.hasOwn(model, "reasoningLevels")));
+  assert.deepEqual(
+    created.modes.availableModes.map((mode) => mode.id),
+    ["plan", "build", "guarded", "yolo"],
+  );
+  assert.deepEqual(
+    created.modes.availableModes.map((mode) => mode.name),
+    ["计划模式", "变更前确认", "自主模式", "完全访问"],
+  );
+
+  await client.request("session/set_config_option", {
+    sessionId,
+    configId: "thought_level",
+    value: "high",
+  });
+  await client.request("session/set_model", { sessionId, modelId: "p1::beta" });
+  const switchedUpdate = client.updates
+    .filter((update) => update.sessionUpdate === "config_option_update")
+    .at(-1);
+  const switchedOption = switchedUpdate.configOptions.find((option) => option.id === "thought_level");
+  assert.equal(switchedOption.currentValue, "xhigh");
+  assert.deepEqual(switchedOption.options.map((option) => option.value), ["low", "medium", "xhigh"]);
+
+  await client.request("session/set_config_option", {
+    sessionId,
+    configId: "thought_level",
+    value: "medium",
+  });
+  const reloaded = await client.request("session/load", { sessionId, cwd: dir, mcpServers: [] });
+  const reloadedOption = reloaded.configOptions.find((option) => option.id === "thought_level");
+  assert.equal(reloadedOption.currentValue, "medium");
+  assert.deepEqual(reloadedOption.options.map((option) => option.value), ["low", "medium", "xhigh"]);
+
+  await client.request("session/set_model", { sessionId, modelId: "p1::alpha" });
+  const restored = await client.request("session/load", { sessionId, cwd: dir, mcpServers: [] });
+  const restoredOption = restored.configOptions.find((option) => option.id === "thought_level");
+  assert.equal(restoredOption.currentValue, "max");
+  assert.deepEqual(restoredOption.options.map((option) => option.value), ["low", "high", "max"]);
 });

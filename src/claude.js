@@ -3,12 +3,22 @@
 import { randomUUID } from "node:crypto";
 import readline from "node:readline";
 import { loadDefaultRuntimeEnv } from "./runtime-env.js";
-import { findModel, listModels } from "./models.js";
+import { findModel, listModels, REASONING_LEVELS } from "./models.js";
 import { discoverCapabilities } from "./commands.js";
 import { rewriteSkillCommand } from "./slash-text.js";
 import { runTurn } from "./zcode.js";
 
-const EFFORT_TO_REASONING = { low: "low", medium: "high", high: "max", xhigh: "max", max: "max" };
+const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
+/** MiCO 与 ZCode 使用同名档位；开关型配置不伪装成强度滑块。 */
+export function effortLevelsForModel(reasoningLevels = REASONING_LEVELS) {
+  return CLAUDE_EFFORT_LEVELS.filter((level) => reasoningLevels.includes(level));
+}
+
+/** 只接受当前模型实际支持的同名档位，不兼容时回退模型默认值。 */
+export function reasoningLevelForEffort(effort, reasoningLevels = REASONING_LEVELS) {
+  return reasoningLevels.includes(effort) ? effort : undefined;
+}
 
 /**
  * 本机已知的命令 / 技能名集合；发现失败返回空集合（此时不改写，按原样下发）。
@@ -26,13 +36,8 @@ async function knownNames() {
   }
 }
 
-/** 把 MiCO/Claude 的三档思考强度映射到 ZCode 的三档推理级别。 */
-export function reasoningLevelForEffort(effort) {
-  return EFFORT_TO_REASONING[effort];
-}
-
 function parseArgs(args) {
-  const options = { model: "zcode", mode: "yolo", resume: undefined, reasoningLevel: undefined };
+  const options = { model: "zcode", mode: "yolo", resume: undefined, effort: undefined };
   for (let index = 0; index < args.length; index++) {
     const value = args[index + 1];
     switch (args[index]) {
@@ -41,7 +46,7 @@ function parseArgs(args) {
         index++;
         break;
       case "--effort":
-        options.reasoningLevel = reasoningLevelForEffort(value);
+        options.effort = value;
         index++;
         break;
       case "--resume":
@@ -95,16 +100,19 @@ function discoveryModels() {
       },
     ];
   }
-  return models.availableModels.map((model) => ({
-    value: model.modelId,
-    resolvedModel: model.modelId,
-    displayName: model.name,
-    description: "ZCode 模型",
-    supportsEffort: true,
-    supportedEffortLevels: ["low", "medium", "high"],
-    supportsAdaptiveThinking: false,
-    supportsThinkingOff: false,
-  }));
+  return models.availableModels.map((model) => {
+    const supportedEffortLevels = effortLevelsForModel(model.reasoningLevels);
+    return {
+      value: model.modelId,
+      resolvedModel: model.modelId,
+      displayName: model.name,
+      description: "ZCode 模型",
+      supportsEffort: supportedEffortLevels.length > 0,
+      supportedEffortLevels,
+      supportsAdaptiveThinking: false,
+      supportsThinkingOff: false,
+    };
+  });
 }
 
 /**
@@ -242,9 +250,13 @@ export async function startClaude(args) {
     };
 
     const selection = findModel(options.model);
+    const reasoningLevel = reasoningLevelForEffort(
+      options.effort,
+      selection?.reasoningLevels ?? REASONING_LEVELS,
+    );
     let model = null;
-    if (selection) model = { ...selection, reasoningLevel: options.reasoningLevel };
-    else if (options.reasoningLevel) model = { reasoningLevel: options.reasoningLevel };
+    if (selection) model = { ...selection, reasoningLevel };
+    else if (reasoningLevel) model = { reasoningLevel };
     // MiCO 下发的 `/技能名` 要改写成 `/skill 技能名`：裸写会被 CLI 判为未知命令。
     const commandText = rewriteSkillCommand(text, await knownNames());
     const startedAt = Date.now();

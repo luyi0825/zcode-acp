@@ -10,15 +10,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-// zcode 的思考级别（reasoningLevel）取值集。headless 同样无参数可设，但
-// 默认级别 = modelConfigRules 中该模型 optionSpecs.reasoningLevel.values 的
-// 最后一项（实测验证），副本里把选中值放到最后即完成切换。
-// 末位 "max" 与不设置 optionSpecs 时的默认行为一致（实测多个模型默认 max）。
+// 找不到模型规则时的旧版回退档位。有元数据时使用该模型实际的
+// optionSpecs.reasoningLevel.values，默认级别取末位（实测验证），
+// 配置副本把选中值移到末位即完成切换。
 export const REASONING_LEVELS = ["low", "high", "max"];
 
 /** 思考级别是否是 zcode 认可的取值（set_config_option 只接受集合内的选择）。 */
-export function isKnownReasoningLevel(value) {
-  return REASONING_LEVELS.includes(value);
+export function isKnownReasoningLevel(value, levels = REASONING_LEVELS) {
+  return levels.includes(value);
 }
 
 // ACP 的 modelId 是单个字符串，而模型由 (providerId, modelId) 二元组决定。
@@ -41,12 +40,13 @@ function isFile(p) {
  * 调用方回退到单模型声明，保证 ACP 链路不断。
  *
  * 规则（与 runtime-env.js 的 env-file 防御一致）：路径必须是绝对路径，
- * 规范化后任一路径段不得为 `..`（禁止目录穿越），且必须是普通文件。
+ * 原始路径任一段不得为 `..`（禁止目录穿越），且必须是普通文件。
  */
 function readProviderConfig(filePath) {
   if (typeof filePath !== "string" || !path.isAbsolute(filePath)) return null;
+  // 必须在 normalize 之前判断：normalize 会把 `..` 解析掉，之后再也查不到。
+  if (filePath.split(/[\\/]/).includes("..")) return null;
   const normalized = path.normalize(filePath);
-  if (normalized.split(/[\\/]/).includes("..")) return null;
   if (!isFile(normalized)) return null;
   try {
     return JSON.parse(readFileSync(normalized, "utf8"));
@@ -58,6 +58,95 @@ function readProviderConfig(filePath) {
 /** 本进程环境中配置的 personal provider config 路径（由 env-file 继承）。 */
 function providerConfigPath() {
   return process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+}
+
+/** 模型配置规则数组；配置损坏时按空规则处理，保留调用方的降级路径。 */
+function modelConfigRules(config, key) {
+  const rules = config?.config?.modelConfigRules?.[key];
+  return Array.isArray(rules) ? rules : [];
+}
+
+/** 与 zcode 一致：模型匹配大小写不敏感，API 类型与 URL 匹配大小写敏感。 */
+function matchesRule(pattern, value, caseInsensitive = false) {
+  if (typeof pattern !== "string" || typeof value !== "string") return false;
+  try {
+    return new RegExp(`^(?:${pattern})$`, caseInsensitive ? "i" : undefined).test(value);
+  } catch {
+    return false;
+  }
+}
+
+/** 与 zcode 的规则匹配一致：比较前去掉 base URL 路径末尾的斜杠，保留 query/hash。 */
+function normalizeBaseUrl(value) {
+  try {
+    const url = new URL(value);
+    const suffix = `${url.search}${url.hash}`;
+    const full = url.toString();
+    return `${(suffix ? full.slice(0, -suffix.length) : full).replace(/\/+$/, "")}${suffix}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 只合并 reasoningLevel.values，其他配置仍由 zcode 自己处理。
+ * 字段缺失表示继承；显式 null 表示清除；找不到任何规则时由调用方使用旧版三档回退。
+ */
+function overlayReasoningLevels(levels, modelConfig) {
+  if (!modelConfig || !Object.hasOwn(modelConfig, "optionSpecs")) return levels;
+  const specs = modelConfig.optionSpecs;
+  if (specs === null) return [];
+  if (!Object.hasOwn(specs, "reasoningLevel")) return levels;
+  const reasoning = specs.reasoningLevel;
+  if (!reasoning || typeof reasoning !== "object") return [];
+  if (!Object.hasOwn(reasoning, "values")) return levels;
+  if (!Array.isArray(reasoning.values)) return [];
+  return [...new Set(reasoning.values.filter((value) => typeof value === "string" && value.trim()))];
+}
+
+/**
+ * 按 zcode 的规则顺序计算单个模型的有效配置。
+ * 顺序：通用模型 → API → 站点 → 模板 → 内置 provider → 个人 provider → 手工配置。
+ */
+function resolveModelConfig(personalConfig, builtinConfig, providerRule, modelId) {
+  const providerId = providerRule.providerId;
+  const apiType = providerRule.config?.api?.type;
+  const baseUrl = normalizeBaseUrl(providerRule.config?.api?.baseUrl);
+  let levels;
+  // 没有启用元数据时保持旧版可见；显式禁用必须过滤，后续规则仍可重新启用。
+  let enabled = true;
+  const overlay = (rule) => {
+    levels = overlayReasoningLevels(levels, rule.config);
+    if (typeof rule.config?.enabled === "boolean") enabled = rule.config.enabled;
+  };
+
+  for (const rule of modelConfigRules(builtinConfig, "modelRules")) {
+    if (matchesRule(rule.modelMatch, modelId, true)) overlay(rule);
+  }
+  for (const rule of modelConfigRules(builtinConfig, "modelApiRules")) {
+    if (matchesRule(rule.modelMatch, modelId, true) && matchesRule(rule.apiTypeMatch, apiType)) overlay(rule);
+  }
+  for (const rule of modelConfigRules(builtinConfig, "providerSiteRules")) {
+    if (
+      matchesRule(rule.modelMatch, modelId, true) &&
+      (rule.apiTypeMatch === undefined || matchesRule(rule.apiTypeMatch, apiType)) &&
+      matchesRule(rule.baseUrlMatch, baseUrl)
+    ) overlay(rule);
+  }
+  for (const rule of modelConfigRules(builtinConfig, "templateModelRules")) {
+    if (rule.templateId === providerRule.templateId && rule.modelId === modelId) overlay(rule);
+  }
+  for (const rule of modelConfigRules(builtinConfig, "builtinProviderModelRules")) {
+    if (rule.providerId === providerId && rule.modelId === modelId) overlay(rule);
+  }
+  for (const rule of modelConfigRules(personalConfig, "providerModelRules")) {
+    if (rule.providerId === providerId && rule.modelId === modelId) overlay(rule);
+  }
+  for (const rule of modelConfigRules(personalConfig, "manualProviderModelRules")) {
+    // 手工规则同样只做 overlay：zcode 只把既有配置投影到手册可表达字段，不清空档位。
+    if (rule.providerId === providerId && rule.modelId === modelId) overlay(rule);
+  }
+  return { enabled, reasoningLevels: levels ?? [...REASONING_LEVELS] };
 }
 
 /** 按 providerOrder 展开启用的 provider 规则（enabled 缺失视为启用，与实测数据一致）。 */
@@ -80,16 +169,20 @@ function orderedRules(config) {
 export function listModels() {
   const config = readProviderConfig(providerConfigPath());
   if (!config) return null;
+  const builtinConfig = readProviderConfig(process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE);
   const availableModels = [];
   for (const rule of orderedRules(config)) {
     const ids = rule.config.modelOrder ?? rule.config.personalModelIds;
     if (!Array.isArray(ids)) continue;
     for (const id of ids) {
       if (typeof id !== "string" || id === "") continue;
+      const modelConfig = resolveModelConfig(config, builtinConfig, rule, id);
+      if (!modelConfig.enabled) continue;
       const label = rule.providerName ?? rule.providerId;
       availableModels.push({
         modelId: encodeModelId({ providerId: rule.providerId, modelId: id }),
         name: `${id.split("/").pop()} (${label})`,
+        reasoningLevels: modelConfig.reasoningLevels,
       });
     }
   }
@@ -107,8 +200,10 @@ export function findModel(value) {
   if (at <= 0) return null;
   const modelId = value.slice(at + SEPARATOR.length);
   if (!modelId) return null;
-  const known = listModels()?.availableModels.some((model) => model.modelId === value);
-  return known ? { providerId: value.slice(0, at), modelId } : null;
+  const known = listModels()?.availableModels.find((model) => model.modelId === value);
+  return known
+    ? { providerId: value.slice(0, at), modelId, reasoningLevels: known.reasoningLevels }
+    : null;
 }
 
 /**
@@ -157,9 +252,11 @@ export function writeSelectionConfig(selection) {
     }
   }
   if (selection.reasoningLevel) {
+    const builtinConfig = readProviderConfig(process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE);
+    const { reasoningLevels: levels } = resolveModelConfig(config, builtinConfig, rule, modelId);
     // 找不到既有 modelConfigRules 条目时补一条，保证 optionSpecs 有落点。
     const modelRules = config.config.modelConfigRules?.providerModelRules;
-    if (Array.isArray(modelRules)) {
+    if (Array.isArray(modelRules) && levels.includes(selection.reasoningLevel)) {
       let modelRule = modelRules.find(
         (r) => r?.modelId === modelId && r?.providerId === rule.providerId,
       );
@@ -170,8 +267,9 @@ export function writeSelectionConfig(selection) {
       modelRule.config.optionSpecs = {
         ...modelRule.config.optionSpecs,
         reasoningLevel: {
+          ...modelRule.config.optionSpecs?.reasoningLevel,
           values: [
-            ...REASONING_LEVELS.filter((level) => level !== selection.reasoningLevel),
+            ...levels.filter((level) => level !== selection.reasoningLevel),
             selection.reasoningLevel,
           ],
         },

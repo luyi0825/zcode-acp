@@ -32,14 +32,15 @@ function isFile(p) {
  * 读取 env-file。
  *
  * 规则：
- * - 路径必须是绝对路径，规范化后不得含 `..`（禁止目录穿越）；
+ * - 路径必须是绝对路径，原始路径任一段不得为 `..`（禁止目录穿越）；
  * - 每行 `KEY=VALUE`，只接受白名单内的键；
  * - 路径不合规或文件不存在时返回空对象。
  */
 export function readRuntimeEnvFile(filePath) {
   if (typeof filePath !== "string" || !path.isAbsolute(filePath)) return {};
+  // 必须在 normalize 之前判断：normalize 会把 `..` 解析掉，之后再也查不到。
+  if (filePath.split(/[\\/]/).includes("..")) return {};
   const normalized = path.normalize(filePath);
-  if (normalized.split(/[\\/]/).includes("..")) return {};
   if (!isFile(normalized)) return {};
 
   const parsed = {};

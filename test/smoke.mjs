@@ -6,8 +6,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { registerAllClients } from "../src/register.js";
-import { reasoningLevelForEffort } from "../src/claude.js";
+import { effortLevelsForModel, reasoningLevelForEffort } from "../src/claude.js";
 import { listSlashCommands } from "../src/commands.js";
+import { listModels } from "../src/models.js";
 
 const BRIDGE = path.resolve(import.meta.dirname, "../bin/cli.js");
 const cwd = mkdtempSync(path.join(tmpdir(), "zcode-acp-smoke-"));
@@ -299,19 +300,21 @@ try {
 
   // 11. 思考级别：configOptions 声明 → set_config_option → 通知 → load 回显 → prompt 可跑
   const reasonSession = await client.request("session/new", { cwd, mcpServers: [] });
-  const reasonOption = (reasonSession.configOptions ?? []).find((o) => o.id === "reasoning");
+  const reasonOption = (reasonSession.configOptions ?? []).find((o) => o.id === "thought_level");
+  const reasonValues = reasonOption?.options.map((option) => option.value) ?? [];
+  const requestedReason = reasonValues[0];
   check(
-    "session/new 声明思考级别选项",
-    reasonOption?.currentValue === "max" &&
+    "session/new 按当前模型声明思考级别选项",
+    reasonOption?.currentValue === reasonValues.at(-1) &&
       reasonOption.category === "thought_level" &&
-      reasonOption.options.some((o) => o.value === "low"),
+      reasonValues.length > 0,
     JSON.stringify(reasonSession.configOptions).slice(0, 200),
   );
   const beforeOptionUpdate = client.updates.length;
   const setOption = await client.request("session/set_config_option", {
     sessionId: reasonSession.sessionId,
-    configId: "reasoning",
-    value: "low",
+    configId: "thought_level",
+    value: requestedReason,
   });
   check("session/set_config_option 不报错", !setOption.error, JSON.stringify(setOption).slice(0, 120));
   check(
@@ -321,12 +324,14 @@ try {
       .some(
         (u) =>
           u.sessionUpdate === "config_option_update" &&
-          (u.configOptions ?? []).some((o) => o.id === "reasoning" && o.currentValue === "low"),
+          (u.configOptions ?? []).some(
+            (o) => o.id === "thought_level" && o.currentValue === requestedReason,
+          ),
       ),
   );
   const badOption = await client.request("session/set_config_option", {
     sessionId: reasonSession.sessionId,
-    configId: "reasoning",
+    configId: "thought_level",
     value: "ultra",
   });
   check("session/set_config_option 非法值不报错", !badOption.error, JSON.stringify(badOption).slice(0, 120));
@@ -335,10 +340,10 @@ try {
     cwd,
     mcpServers: [],
   });
-  const reloadedOption = (reasonReloaded.configOptions ?? []).find((o) => o.id === "reasoning");
+  const reloadedOption = (reasonReloaded.configOptions ?? []).find((o) => o.id === "thought_level");
   check(
     "session/load 回显选中思考级别",
-    reloadedOption?.currentValue === "low",
+    reloadedOption?.currentValue === requestedReason,
     JSON.stringify(reloadedOption?.currentValue),
   );
   // 选中思考级别下跑一轮，验证 optionSpecs 副本不破坏 zcode 启动
@@ -552,10 +557,11 @@ try {
     JSON.stringify({ code: claudeRun.code, stderr: claudeRun.stderr, result: claudeResult }).slice(0, 800),
   );
   check(
-    "Claude low/medium/high 映射 ZCode low/high/max",
+    "Claude 与 ZCode 使用同名思考档位",
     reasoningLevelForEffort("low") === "low" &&
-      reasoningLevelForEffort("medium") === "high" &&
-      reasoningLevelForEffort("high") === "max",
+      reasoningLevelForEffort("medium") === undefined &&
+      reasoningLevelForEffort("high") === "high" &&
+      reasoningLevelForEffort("max") === "max",
   );
   // 16. MiCO 模型发现走 control_request/initialize，不启动真实模型调用。
   const discoveryRun = await runClaude(
@@ -564,11 +570,16 @@ try {
   );
   const discoveryResponse = discoveryRun.events.find((event) => event.type === "control_response");
   const discoveryModels = discoveryResponse?.response?.response?.models;
+  const discoveredSource = listModels()?.availableModels.find(
+    (model) => model.modelId === discoveryModels?.[0]?.value,
+  );
+  const expectedEfforts = effortLevelsForModel(discoveredSource?.reasoningLevels).join(",");
   check(
-    "Claude 模型发现返回三档思考能力",
+    "Claude 模型发现按模型返回思考能力",
     discoveryRun.code === 0 &&
       discoveryResponse?.response?.request_id === "mico-model-discovery" &&
-      discoveryModels?.[0]?.supportedEffortLevels?.join(",") === "low,medium,high",
+      discoveryModels?.[0]?.supportedEffortLevels?.join(",") === expectedEfforts &&
+      discoveryModels?.[0]?.supportsEffort === (expectedEfforts.length > 0),
     JSON.stringify(discoveryRun.events),
   );
   check(

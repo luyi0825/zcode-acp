@@ -27,18 +27,16 @@ const AUTH_METHODS = [
   },
 ];
 
-// 权限模式：id 沿用 zcode 原生枚举（--mode 的合法取值），跨端语义一致。
-// 默认 yolo：headless 没有确认入口，与 zcode 对 --prompt 的默认一致；
-// plan（只读）/ guarded（最严）等受控模式由客户端按需选择。
+// 权限模式与 ZCode 选择器保持一致；edit 仅接受旧客户端回传，不作为可选项展示。
+// 默认 yolo：headless 没有确认入口，与 zcode 对 --prompt 的默认一致。
 const DEFAULT_MODE = "yolo";
 const MODES = [
-  { id: "plan", name: "Plan" },
-  { id: "build", name: "Build" },
-  { id: "edit", name: "Edit" },
-  { id: "guarded", name: "Guarded" },
-  { id: "yolo", name: "Yolo" },
+  { id: "plan", name: "计划模式", description: "编辑前先出计划。" },
+  { id: "build", name: "变更前确认", description: "改文件前先问我。" },
+  { id: "guarded", name: "自主模式", description: "在有风险时询问。" },
+  { id: "yolo", name: "完全访问", description: "减少确认次数。" },
 ];
-const MODE_IDS = new Set(MODES.map((mode) => mode.id));
+const MODE_IDS = new Set([...MODES.map((mode) => mode.id), "edit"]);
 
 // 会话记录（本进程签发）。客户端回传的会话 id 只做等值比对，
 // 命中的始终是本地记录对象，外部值不参与任何寻址。
@@ -104,15 +102,31 @@ function modelsPayload(record) {
     };
   }
   return {
-    availableModels: models.availableModels,
+    // reasoningLevels 是 bridge 内部元数据，不塞进 ACP 的非标准模型字段。
+    availableModels: models.availableModels.map(({ modelId, name, description }) => ({
+      modelId,
+      name,
+      description,
+    })),
     currentModelId: record?.model ? encodeModelId(record.model) : models.currentModelId,
   };
 }
 
 // ACP 新版用 configOptions 声明可调选项；旧版字段（models/modes）与之并存。
 // category=thought_level 是客户端识别思考档位的语义标记，不能只靠自定义 id。
-const REASONING_OPTION_ID = "reasoning";
-const REASONING_NAMES = { low: "低", high: "高", max: "最大" };
+const REASONING_OPTION_ID = "thought_level";
+const REASONING_OPTION_IDS = new Set([REASONING_OPTION_ID, "reasoning"]);
+const REASONING_NAMES = {
+  disabled: "关闭",
+  enabled: "开启",
+  none: "无",
+  minimal: "最小",
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "超高",
+  max: "最大",
+};
 
 /**
  * 会话响应里的 modes 声明（ACP 旧版字段，与 configOptions 并存）。
@@ -126,20 +140,33 @@ function modesPayload(record) {
   };
 }
 
+/** 当前模型的有效思考档位；选中模型已携带元数据时无需再次读配置。 */
+function reasoningLevelsForRecord(record) {
+  if (record?.model?.reasoningLevels) return record.model.reasoningLevels;
+  const models = listModels();
+  const currentId = record?.model ? encodeModelId(record.model) : models?.currentModelId;
+  const current = models?.availableModels.find((model) => model.modelId === currentId);
+  return current?.reasoningLevels ?? REASONING_LEVELS;
+}
+
 /**
- * 思考级别选项（configOptions 形态）。未选择时回显 "max"，
- * 与 headless 不设置 optionSpecs 时的默认级别一致（实测）。
+ * 思考级别选项（configOptions 形态）。档位与默认值都来自当前模型的有效规则；
+ * 模型明确不支持思考选项时不返回该选择器。
  */
 function configOptionsPayload(record) {
+  const levels = reasoningLevelsForRecord(record);
+  if (levels.length === 0) return [];
+  const selected = record?.reasoningLevel;
+  const currentValue = selected && levels.includes(selected) ? selected : levels.at(-1);
   return [
     {
       id: REASONING_OPTION_ID,
       name: "思考级别",
-      description: "ZCode 的推理深度（reasoningLevel）",
+      description: "当前 ZCode 模型支持的推理深度（reasoningLevel）",
       category: "thought_level",
       type: "select",
-      currentValue: record?.reasoningLevel ?? "max",
-      options: REASONING_LEVELS.map((level) => ({ value: level, name: REASONING_NAMES[level] ?? level })),
+      currentValue,
+      options: levels.map((level) => ({ value: level, name: REASONING_NAMES[level] ?? level })),
     },
   ];
 }
@@ -271,11 +298,19 @@ export function startAgent() {
     .onRequest(
       "session/set_model",
       (params) => (typeof params === "object" && params !== null ? params : {}),
-      (ctx) => {
+      async (ctx) => {
         const record = findRecord(ctx.params.sessionId);
         const selection = findModel(ctx.params.modelId);
         if (record && selection) {
           record.model = selection;
+          // 旧档位可能不受新模型支持，清空后由 configOptionsPayload 回显新模型默认档位。
+          if (!isKnownReasoningLevel(record.reasoningLevel, selection.reasoningLevels)) {
+            record.reasoningLevel = null;
+          }
+          await emitUpdate(record.id, {
+            sessionUpdate: "config_option_update",
+            configOptions: configOptionsPayload(record),
+          }).catch(() => {});
         }
         return {};
       },
@@ -308,8 +343,8 @@ export function startAgent() {
         const record = findRecord(ctx.params.sessionId);
         if (
           record &&
-          ctx.params.configId === REASONING_OPTION_ID &&
-          isKnownReasoningLevel(ctx.params.value)
+          REASONING_OPTION_IDS.has(ctx.params.configId) &&
+          isKnownReasoningLevel(ctx.params.value, reasoningLevelsForRecord(record))
         ) {
           record.reasoningLevel = ctx.params.value;
           await emitUpdate(record.id, {
