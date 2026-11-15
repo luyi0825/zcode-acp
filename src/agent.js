@@ -14,7 +14,7 @@ import { rewriteSkillCommand } from "./slash-text.js";
 import { loadDefaultRuntimeEnv } from "./runtime-env.js";
 import { encodeModelId, findModel, isKnownReasoningLevel, listModels, REASONING_LEVELS } from "./models.js";
 
-export const AGENT_INFO = { name: "zcode-acp", title: "ZCode", version: "0.5.3" };
+export const AGENT_INFO = { name: "zcode-acp", title: "ZCode", version: "0.5.4" };
 
 // 认证方式声明：ACP Registry 校验 authMethods 非空，空数组会让上架 CI 直接拒绝。
 // 凭据由 zcode CLI 自己持有（login / Desktop 签发），客户端无需提供任何东西，

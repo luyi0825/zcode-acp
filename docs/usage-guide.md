@@ -1,7 +1,7 @@
 # zcode-acp 使用指南
 
 面向使用者的接入手册：安装、接入 OpenIDEA、验证与排障。
-对应 `@luyi0825/zcode-acp` 0.5.3；最后更新：2026-11-15。
+对应 `@luyi0825/zcode-acp` 0.5.4；最后更新：2026-11-16。
 
 zcode-acp 把 [ZCode](https://zcode.z.ai) CLI 包装成 **ACP v1 agent**，让 ACP 客户端把 ZCode 当作自己的编码 agent：
 
@@ -26,8 +26,8 @@ zcode-acp 只做协议翻译；工具、技能、MCP、多轮上下文等 agent 
 再用 npm 从本地安装：
 
 ```bash
-npm install -g ./luyi0825-zcode-acp-0.5.3.tgz
-zcode-acp --version    # 输出版本号（当前 0.5.3）即安装成功
+npm install -g ./luyi0825-zcode-acp-0.5.4.tgz
+zcode-acp --version    # 输出版本号（当前 0.5.4）即安装成功
 ```
 
 ## 3. 登录与认证

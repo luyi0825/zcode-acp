@@ -83,6 +83,125 @@ function emit(event) {
   process.stdout.write(`${JSON.stringify(event)}\n`);
 }
 
+// 单条工具结果上限：Bash 动辄几十 KB 输出，整段推给宿主会撑爆消息体。
+const MAX_TOOL_RESULT = 20000;
+
+// 语义事件保活间隔：宿主按「距上次语义事件」判活（实测预算 10 分钟），
+// 纯文本长任务不产生工具事件，需要定期把已累积文本作为一段发出。
+const SEMANTIC_KEEPALIVE_MS = 60_000;
+
+/** 工具输出裁剪到上限；非字符串返回空串。 */
+function clipToolResult(value) {
+  if (typeof value !== "string") return "";
+  return value.length > MAX_TOOL_RESULT ? `${value.slice(0, MAX_TOOL_RESULT)}…` : value;
+}
+
+/**
+ * zcode 事件 → Claude stream-json 语义消息（assistant / user）。
+ *
+ * 背景：宿主按「距上次语义事件」判断任务是否还活着，超时即按
+ * provider_zero_events 判死。整轮只回一条最终结果时，跑十几分钟的长任务
+ * 必然被误杀；这里把工具流实时翻成 assistant(tool_use) / user(tool_result)，
+ * 让每次工具起止都成为一次可观测进展。
+ *
+ * 规则：
+ * - 文本增量只累积不立刻发：碎片化的 assistant 消息在客户端会变成一串气泡；
+ * - 工具 scheduled 是收口点，累积文本与该 tool_use 合成一条 assistant 消息；
+ * - 工具 result 翻成 user 消息里的 tool_result，is_error 取 success === false；
+ * - flush 用于收尾与长时间纯文本保活，只吐尚未发出的文本，不重复；
+ * - 其余事件返回 null，调用方据此不发任何消息。
+ */
+export function createSemanticStream() {
+  let pendingText = "";
+  let produced = false;
+
+  /** 取出并清空已累积的文本：工具边界与 flush 都用它收口，保证不重复发送。 */
+  function takeText() {
+    const text = pendingText;
+    pendingText = "";
+    return text;
+  }
+
+  function build(event) {
+    if (event?.type === "model.streaming" && event.payload?.kind === "text_delta") {
+      if (typeof event.payload.delta === "string") pendingText += event.payload.delta;
+      return null;
+    }
+    if (event?.type !== "tool.updated") return null;
+    const payload = event.payload ?? {};
+    const toolUseId = typeof payload.toolCallId === "string" ? payload.toolCallId : "";
+    if (!toolUseId) return null;
+
+    if (payload.kind === "scheduled") {
+      const content = [];
+      const text = takeText();
+      if (text) content.push({ type: "text", text });
+      // 工具名缺失也照发：宿主靠这张卡片判断「有工具在跑」，不能静默丢弃。
+      content.push({
+        type: "tool_use",
+        id: toolUseId,
+        name: payload.toolName || "unknown",
+        input: payload.input ?? {},
+      });
+      return { type: "assistant", message: { role: "assistant", content } };
+    }
+
+    if (payload.kind === "result") {
+      const raw = payload.result ?? payload.output;
+      const text = typeof raw === "string" ? raw : raw?.content;
+      return {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: toolUseId,
+              content: clipToolResult(text),
+              is_error: raw?.success === false,
+            },
+          ],
+        },
+      };
+    }
+    return null;
+  }
+
+  return {
+    /** 本轮是否已产出过语义消息：收尾时据此决定要不要补整段兜底。 */
+    produced: () => produced,
+
+    consume(event) {
+      const semantic = build(event);
+      if (semantic) produced = true;
+      return semantic;
+    },
+
+    flush() {
+      const text = takeText();
+      if (!text.trim()) return null;
+      produced = true;
+      return { type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } };
+    },
+  };
+}
+
+/** 发一条语义消息：补齐 id / session_id / uuid，宿主只认完整形态。 */
+function emitSemantic(sessionId, modelName, semantic) {
+  if (!semantic) return;
+  const message =
+    semantic.type === "assistant"
+      ? { id: randomUUID(), type: "message", model: modelName, ...semantic.message }
+      : semantic.message;
+  emit({
+    type: semantic.type,
+    message,
+    parent_tool_use_id: null,
+    session_id: sessionId,
+    uuid: randomUUID(),
+  });
+}
+
 function discoveryModels() {
   const models = listModels();
   if (!models) {
@@ -260,6 +379,12 @@ export async function startClaude(args) {
     // Mutica 下发的 `/技能名` 要改写成 `/skill 技能名`：裸写会被 CLI 判为未知命令。
     const commandText = rewriteSkillCommand(text, await knownNames());
     const startedAt = Date.now();
+    const semantics = createSemanticStream();
+    // 保活：长任务在两次工具调用之间可能长时间没有语义事件，宿主会判死。
+    const keepalive = setInterval(() => {
+      emitSemantic(sessionId, options.model, semantics.flush());
+    }, SEMANTIC_KEEPALIVE_MS);
+    keepalive.unref();
     const result = await runTurn({
       cwd: process.cwd(),
       text: commandText,
@@ -270,27 +395,26 @@ export async function startClaude(args) {
         stop = stopTurn;
       },
       onEvent: (event) => {
-        if (!event.sessionId) return;
-        sessionId = event.sessionId;
-        emitInit();
+        if (event.sessionId) {
+          sessionId = event.sessionId;
+          emitInit();
+        }
+        emitSemantic(sessionId, options.model, semantics.consume(event));
       },
-    });
+    }).finally(() => clearInterval(keepalive));
     emitInit();
 
     const content = result.error ?? result.content ?? "";
-    emit({
-      type: "assistant",
-      message: {
-        id: randomUUID(),
-        model: options.model,
-        role: "assistant",
-        type: "message",
-        content: [{ type: "text", text: content }],
-      },
-      parent_tool_use_id: null,
-      session_id: sessionId,
-      uuid: randomUUID(),
-    });
+    // 收尾：先吐最后一段未发出的文本，避免结尾回复丢失。
+    emitSemantic(sessionId, options.model, semantics.flush());
+    // 正常路径下文本已随语义消息分段发出，整段再发一次会让宿主侧回复重复；
+    // 只有全程没有任何增量事件（老版本 CLI 或纯错误）时才回退成整段发出。
+    if (content && (result.error || !semantics.produced())) {
+      emitSemantic(sessionId, options.model, {
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: content }] },
+      });
+    }
     emit({
       type: "result",
       subtype: "success",

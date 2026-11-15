@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { findModel, listModels, writeSelectionConfig } from "../src/models.js";
-import { effortLevelsForModel, reasoningLevelForEffort } from "../src/claude.js";
+import { createSemanticStream, effortLevelsForModel, reasoningLevelForEffort } from "../src/claude.js";
 import { readRuntimeEnvFile } from "../src/runtime-env.js";
 import { applyZcodeRuntimeEnv } from "../src/zcode.js";
 
@@ -216,6 +216,89 @@ test("claudeEffortMappingFollowsModelCapabilities", () => {
 });
 
 // 守卫必须在 normalize 之前判断：normalize 会把 `..` 解析掉，之后检查永远为假。
+// 用户消息里的语义事件流：宿主的看门狗按「距上次语义事件」判活，
+// 整轮只回最终结果会让长任务被误杀（实测 provider_zero_events）。
+test("semanticStreamEmitsToolUseAndToolResult", () => {
+  const stream = createSemanticStream();
+  assert.equal(stream.produced(), false);
+
+  // 文本增量只累积，不单独发消息。
+  assert.equal(
+    stream.consume({ type: "model.streaming", payload: { kind: "text_delta", delta: "先读文件" } }),
+    null,
+  );
+  assert.equal(stream.produced(), false);
+
+  // 工具 scheduled 收口：累积文本与 tool_use 合成一条 assistant 消息。
+  const scheduled = stream.consume({
+    type: "tool.updated",
+    payload: { kind: "scheduled", toolCallId: "c1", toolName: "Read", input: { file_path: "a.txt" } },
+  });
+  assert.equal(scheduled.type, "assistant");
+  assert.deepEqual(scheduled.message.content, [
+    { type: "text", text: "先读文件" },
+    { type: "tool_use", id: "c1", name: "Read", input: { file_path: "a.txt" } },
+  ]);
+  assert.equal(stream.produced(), true);
+
+  // 同一工具的 started 段只是状态推进，不产生新消息（避免重复卡片）。
+  assert.equal(
+    stream.consume({ type: "tool.updated", payload: { kind: "started", toolCallId: "c1" } }),
+    null,
+  );
+
+  const result = stream.consume({
+    type: "tool.updated",
+    payload: { kind: "result", toolCallId: "c1", result: { success: true, content: "file body" } },
+  });
+  assert.equal(result.type, "user");
+  assert.deepEqual(result.message.content, [
+    { type: "tool_result", tool_use_id: "c1", content: "file body", is_error: false },
+  ]);
+
+  // 失败结果必须标 is_error，宿主据此区分成功与失败卡片。
+  const failed = stream.consume({
+    type: "tool.updated",
+    payload: { kind: "result", toolCallId: "c2", result: { success: false, content: "boom" } },
+  });
+  assert.equal(failed.message.content[0].is_error, true);
+});
+
+// 收尾与保活都靠 flush：它只吐未发出的文本，不重复已发内容。
+test("semanticStreamFlushEmitsPendingTextOnce", () => {
+  const stream = createSemanticStream();
+  stream.consume({ type: "model.streaming", payload: { kind: "text_delta", delta: "最终结论" } });
+  const flushed = stream.flush();
+  assert.deepEqual(flushed.message.content, [{ type: "text", text: "最终结论" }]);
+  assert.equal(stream.produced(), true);
+  // 再 flush 不能重复发出同一段文本。
+  assert.equal(stream.flush(), null);
+  // 空白增量不算内容，不产生空消息。
+  stream.consume({ type: "model.streaming", payload: { kind: "text_delta", delta: "   " } });
+  assert.equal(stream.flush(), null);
+});
+
+// 工具结果裁剪上限：Bash 输出可能几十 KB，整段推给宿主会撑爆消息体。
+test("semanticStreamClipsOversizedToolResult", () => {
+  const stream = createSemanticStream();
+  const huge = "x".repeat(30000);
+  const message = stream.consume({
+    type: "tool.updated",
+    payload: { kind: "result", toolCallId: "c1", result: { success: true, content: huge } },
+  });
+  const content = message.message.content[0].content;
+  assert.equal(content.length, 20001);
+  assert.ok(content.endsWith("…"));
+});
+
+// 缺 toolCallId 的事件无法与工具卡片配对，必须整条丢弃而不是发半截消息。
+test("semanticStreamIgnoresEventsWithoutToolCallId", () => {
+  const stream = createSemanticStream();
+  assert.equal(stream.consume({ type: "tool.updated", payload: { kind: "scheduled" } }), null);
+  assert.equal(stream.consume({ type: "session.updated", payload: {} }), null);
+  assert.equal(stream.produced(), false);
+});
+
 test("configurationPathsRejectParentTraversal", (t) => {
   const dir = makeTempDir(t);
   isolateEnv(t, ["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"]);
