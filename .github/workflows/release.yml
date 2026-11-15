@@ -1,6 +1,6 @@
 name: release
 
-# tag 一推就发版：跑测试 → npm pack → 用 mydoc/releases/<tag>.md 建 Release 并上传 tarball。
+# tag 一推就发版：跑测试 → npm pack → 用 docs/releases/<tag>.md 建 Release 并上传 tarball。
 # GITHUB_TOKEN 自带 contents: write，无需额外 secret。
 on:
   push:
@@ -37,7 +37,7 @@ jobs:
       # notes 缺失时直接失败：静默回退到自动生成的 commit 列表会丢手写内容。
       - name: 校验 release notes
         run: |
-          NOTES="mydoc/releases/${GITHUB_REF_NAME}.md"
+          NOTES="docs/releases/${GITHUB_REF_NAME}.md"
           if [ ! -f "$NOTES" ]; then
             echo "::error::缺少 $NOTES，请先随代码提交该版本的 release notes"
             exit 1
@@ -53,6 +53,6 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --notes-file "mydoc/releases/${GITHUB_REF_NAME}.md" \
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md" \
             --verify-tag \
             "${{ steps.pack.outputs.tgz }}"
