@@ -28,7 +28,7 @@ export async function runDoctor({ probe = false } = {}) {
   };
   const warn = (label) => console.warn(`  [warn] ${label}`);
 
-  console.log("zcode-acp-bridge 自检\n");
+  console.log("zcode-acp 自检\n");
 
   // 1. Node 运行时
   const [major] = process.versions.node.split(".").map(Number);
@@ -48,7 +48,7 @@ export async function runDoctor({ probe = false } = {}) {
   //（<ZCODE_DATA_BASE_DIR 或 home>/.zcode/v2/credentials.json）。
   const credPath = path.join(process.env.ZCODE_DATA_BASE_DIR ?? homedir(), ".zcode", "v2", "credentials.json");
   if (existsSync(credPath)) ok(`已登录（凭据：${credPath}）`);
-  else warn(`未登录（${credPath} 不存在）。执行 zcode-acp-bridge login 登录；纯 api-key 配置可忽略`);
+  else warn(`未登录（${credPath} 不存在）。执行 zcode-acp login 登录；纯 api-key 配置可忽略`);
 
   // 4. 模型列表（personal provider config 可读才有）
   const models = listModels();

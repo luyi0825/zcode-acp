@@ -17,8 +17,8 @@ function check(name, ok, detail) {
 }
 
 // 极简 ACP 客户端：NDJSON 帧 + 请求/通知分发。
-function startClient() {
-  const child = spawn(process.execPath, [BRIDGE], { stdio: ["pipe", "pipe", "pipe"] });
+function startClient(args = []) {
+  const child = spawn(process.execPath, [BRIDGE, ...args], { stdio: ["pipe", "pipe", "pipe"] });
   const pending = new Map();
   const updates = [];
   let nextId = 1;
@@ -90,7 +90,19 @@ try {
     clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
   });
   check("initialize 返回 protocolVersion", init.protocolVersion === 1, JSON.stringify(init));
-  check("initialize 声明 agentInfo.name", init.agentInfo?.name === "zcode-acp-bridge");
+  check("initialize 声明 agentInfo.name", init.agentInfo?.name === "zcode-acp");
+
+  // MiCO qoder 适配器会在启动命令前加 --yolo，必须先能完成 ACP 握手。
+  const qoderClient = startClient(["--yolo"]);
+  try {
+    const qoderInit = await qoderClient.request("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+    });
+    check("MiCO qoder --yolo 启动兼容", qoderInit.protocolVersion === 1, qoderClient.stderr());
+  } finally {
+    qoderClient.kill();
+  }
 
   // 2. 建会话
   const { sessionId } = await client.request("session/new", { cwd, mcpServers: [] });

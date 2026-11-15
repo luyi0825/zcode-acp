@@ -3,7 +3,7 @@
 // 官方不单独分发、也不在 PATH 上放命令；这里按标准安装路径自适应定位，
 // 用系统 Node 运行。不用安装根里的 Electron 二进制：ELECTRON_RUN_AS_NODE
 // 模式下实测拿不到完整凭据环境（provider 401）。
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { mergeRuntimeEnv } from "./runtime-env.js";
@@ -44,6 +44,29 @@ function installRoots() {
     roots.push("/Applications/ZCode.app");
   }
   return roots;
+}
+
+/**
+ * 结束整棵进程树。
+ * Windows：PATH 上的 node 可能是版本管理器 shim（mise/volta/fnm），shim 再拉真 node；
+ *   child.kill() 只杀 shim，真身带着 stdout 管道继续跑，close 永不触发（stop 失效）。
+ *   taskkill /T /F 连 shim 带真身及 zcode 工具调用拉起的孙进程一并终止。
+ * POSIX：子进程以 detached 启动自成进程组，按组发 SIGKILL；组不存在时退回单进程 kill。
+ */
+function killTree(child) {
+  if (WIN) {
+    if (child.pid != null) {
+      execFile("taskkill", ["/pid", String(child.pid), "/T", "/F"], () => {});
+    } else {
+      child.kill();
+    }
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    child.kill();
+  }
 }
 
 /** 只认已存在的普通文件。 */
@@ -161,7 +184,7 @@ function buildArgs({ cli, text, cwd, resume, mode }) {
  * 规则：
  * - 每轮独立进程；多轮上下文由 `--resume <zcodeSessionId>` 续接。
  * - 本函数只负责搬运事件，不了解 ACP 语义。
- * - 取消由调用方通过 `onStart` 拿到的 stop 函数触发，stop 直接结束子进程。
+ * - 取消由调用方通过 `onStart` 拿到的 stop 函数触发，stop 结束整棵进程树（见 killTree）。
  *
  * @param {object} opts
  * @param {string} opts.cwd 工作目录（已归一化的绝对路径）
@@ -197,16 +220,24 @@ export function runTurn({ cwd, text, resume, mode, model, onStart, onEvent }) {
       cwd,
       env,
       windowsHide: true,
+      // POSIX 下自成进程组，stop 时按组杀（见 killTree）。Windows 无进程组，不用。
+      detached: !WIN,
     });
 
     let zcodeSessionId;
     let content;
     let cancelled = false;
     let stderr = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
 
     onStart?.(() => {
       cancelled = true;
-      child.kill();
+      killTree(child);
     });
 
     onNdjsonStream(child.stdout, (event) => {
@@ -225,23 +256,29 @@ export function runTurn({ cwd, text, resume, mode, model, onStart, onEvent }) {
       if (stderr.length > 8000) stderr = stderr.slice(-8000);
     });
 
-    child.on("error", (err) => resolve({ error: `无法启动 zcode：${err.message}` }));
+    child.on("error", (err) => finish({ error: `无法启动 zcode：${err.message}` }));
+
+    child.on("exit", () => {
+      // 兜底：cancel 场景下不等管道排空。被 taskkill 的进程若有幸存句柄拖住
+      // stdout 管道，close 可能迟迟不来，而取消结果不需要等剩余输出。
+      if (cancelled) finish({ sessionId: zcodeSessionId, cancelled: true });
+    });
 
     child.on("close", (code) => {
       if (cancelled) {
-        resolve({ sessionId: zcodeSessionId, cancelled: true });
+        finish({ sessionId: zcodeSessionId, cancelled: true });
       } else if (content !== undefined) {
-        resolve({ sessionId: zcodeSessionId, content });
+        finish({ sessionId: zcodeSessionId, content });
       } else {
         // 保留较多行：zcode 的 401/认证类错误需要上下文才能定位。
         const tail = stderr.trim().split("\n").slice(-40).join("\n");
         // 认证过期最常见（ZCode Desktop 重启会换 token），给出可执行的修复指引，
         // 用户在客户端里直接能看到，不用翻日志。
         const authHint = /API Key 不存在|invalid_key|statusCode: 401/.test(stderr)
-          ? "\n\n>>> 认证已过期或未登录。请执行 zcode-acp-bridge login 重新登录后重试。"
+          ? "\n\n>>> 认证已过期或未登录。请执行 zcode-acp login 重新登录后重试。"
           : "";
         const ctx = `[debug] cwd=${cwd} HOME=${env.HOME ?? "(unset)"} cli=${cli} node=${node}`;
-        resolve({
+        finish({
           sessionId: zcodeSessionId,
           error: `zcode 退出码 ${code}\n${ctx}${tail ? `\n${tail}` : ""}${authHint}`,
         });

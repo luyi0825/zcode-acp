@@ -11,7 +11,7 @@ import { attachClient, emitText, emitUpdate } from "./emitter.js";
 import { loadDefaultRuntimeEnv } from "./runtime-env.js";
 import { encodeModelId, findModel, isKnownReasoningLevel, listModels, REASONING_LEVELS } from "./models.js";
 
-export const AGENT_INFO = { name: "zcode-acp-bridge", title: "ZCode", version: "0.5.2" };
+export const AGENT_INFO = { name: "zcode-acp", title: "ZCode", version: "0.5.3" };
 
 // 权限模式：id 沿用 zcode 原生枚举（--mode 的合法取值），跨端语义一致。
 // 默认 yolo：headless 没有确认入口，与 zcode 对 --prompt 的默认一致；

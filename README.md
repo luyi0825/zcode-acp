@@ -1,10 +1,10 @@
-# zcode-acp-bridge
+# zcode-acp
 
 把 [ZCode](https://zcode.z.ai) CLI 包装成 **ACP v1 agent**，让 Zed / OpenIdea / Neovim 等
 任意 ACP（Agent Client Protocol）客户端把 ZCode 当作自己的编码 agent 使用。
 
 ```
-ACP 客户端 ──stdio NDJSON (ACP v1)──▶ zcode-acp-bridge ──spawn──▶ zcode CLI（headless）
+ACP 客户端 ──stdio NDJSON (ACP v1)──▶ zcode-acp ──spawn──▶ zcode CLI（headless）
 ```
 
 bridge 只做协议翻译：ZCode 的 agent 能力（工具、skills、MCP、hooks、多轮上下文）
@@ -20,7 +20,7 @@ bridge 只做协议翻译：ZCode 的 agent 能力（工具、skills、MCP、hoo
 ## 快速开始
 
 ```bash
-npm install -g zcode-acp-bridge
+npm install -g @luyi0825/zcode-acp
 zcode-acp login      # 浏览器授权登录（一次性）
 zcode-acp doctor     # 自检：CLI 定位 / 登录态 / 模型列表
 ```
@@ -83,6 +83,32 @@ provider 配置副本**（临时目录，随机文件名）喂给子进程——
 已知限制：选择存在 bridge 进程内存里，bridge 重启后回到默认值，客户端重选一次即可；
 同一会话内多轮续接（`--resume`）保持选中项。
 
+### 在 MiCO 上启用思考级别
+
+MiCO 通过「自定义 runtime profile」接入本 bridge，**profile 的 protocol family
+决定思考级别是否可用**（实测 0.6.216）：
+
+- `kimi`：无思考级别支持。服务端拒绝任何取值（`thinking_level "high" is not
+  a recognised value for runtime "kimi"`），界面上不出现选择入口；
+- `acp`：当前服务端模型发现执行器未接入（报 `unknown agent type: "acp"`），
+  模型列表拿不到；
+- `qoder`：**全链路可用**。`mico agent create/update --thinking-level low|high|max`
+  经 daemon 的 qoder 适配器转成对 bridge 的 ACP 配置调用，bridge 写入 provider
+  配置副本（验证方式：`%TEMP%/zcode-acp-provider-*.json` 里
+  `optionSpecs.reasoningLevel.values` 末位即生效级别）。
+
+注册示例（protocol family 创建后不可改，换族需删 profile 重建并把 agent
+`--runtime-id` 换绑到新 runtime）：
+
+```bash
+mico runtime profile create --command-name zcode-acp --display-name "ZCode ACP" \
+  --protocol-family qoder
+# 等 daemon 注册出 runtime 后：
+mico runtime list --output json        # 拿到 runtime_id
+mico agent create --name "本地zcode" --runtime-id <runtime_id> \
+  --thinking-level high                # 也可创建后 update
+```
+
 ## 工作方式
 
 - 每轮 prompt 独立 spawn `zcode -p --output-format stream-json --mode yolo`，
@@ -103,20 +129,22 @@ provider 配置副本**（临时目录，随机文件名）喂给子进程——
 | `401 API Key 不存在` | 未登录或认证过期：`zcode-acp login`（Desktop 用户：在 Desktop 终端里 `setup`） |
 | `找不到 zcode.cjs` | 安装 ZCode Desktop，或设 `ZCODE_HOME` 指向安装目录 |
 | 模型列表为空 / 选不了模型 | `zcode-acp doctor` 看第 4 项；通常是未登录（provider 配置未生成） |
-| Windows 下客户端拉不起 | 确认 `where zcode-acp` 能命中 npm 全局 bin，必要时重开客户端 |
+| Windows 下客户端拉不起 | 确认 `where zcode-acp` 命中预期形态（npm 全局 bin 或 `~/.local/bin/zcode-acp.exe`），必要时重开客户端 |
 
 ## 开发
 
 ```bash
 npm install
-npm run smoke          # 32 项协议自测（需要本机已登录 zcode）
+npm run smoke          # 协议自测（需要本机已登录 zcode）
+npm run release        # 本机一键发布：构建 exe → 部署到 ~/.local/bin → 自检
 ```
 
-可选：构建不依赖 Node 的单文件可执行程序（部分宿主只接受真 .exe）：
-
-```bash
-bash build/build-exe.sh   # 产出 build/zcode-acp-bridge.exe
-```
+可选形态：不依赖 Node 的单文件可执行程序（部分宿主只接受真可执行文件，
+不接受 .cmd/.js）。单文件产物与 npm 形态共用同一 CLI 入口（`src/cli.js`），
+子命令行为一致。只构建不部署用 `bash build/build-exe.sh`（自动以
+`process.execPath` 定位真实 Node，不受 PATH 上版本管理器 shim 影响），
+产出 `build/zcode-acp.exe`（POSIX 为 `build/zcode-acp`；
+macOS 会自动处理 Mach-O 段名与 ad-hoc 重签）。
 
 ## 许可证
 
