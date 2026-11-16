@@ -1,51 +1,37 @@
 // 定位并调用本机 zcode CLI。
+// CLI 定位本身在 cli-locate.js（models.js 也要用，放在这里会形成循环依赖）。
 // 背景：zcode CLI 随 ZCode Desktop 发行（Windows 在安装根 resources/glm，
 // macOS 在 app bundle 的 Contents/Resources/glm），官方不单独分发、也不在
-// PATH 上放命令；这里按标准安装路径自适应定位，
-// 用系统 Node 运行。不用安装根里的 Electron 二进制：ELECTRON_RUN_AS_NODE
-// 模式下实测拿不到完整凭据环境（provider 401）。
-import { execFile, spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+// PATH 上放命令；用系统 Node 运行。不用安装根里的 Electron 二进制：
+// ELECTRON_RUN_AS_NODE 模式下实测拿不到完整凭据环境（provider 401）。
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import { mergeRuntimeEnv } from "./runtime-env.js";
+import { resolveZcode } from "./cli-locate.js";
+import { builtinProviderConfigAt, dataBaseDir, homeDir, mergeRuntimeEnv } from "./runtime-env.js";
 import { writeSelectionConfig } from "./models.js";
 
-const WIN = process.platform === "win32";
+// CLI 定位在 cli-locate.js；这里转出给 login/commands/doctor 沿用原有导入路径。
+export { resolveZcode };
 
-// ZCode 安装根下的固定相对路径，可执行文件只能从这里派生。
-const CLI_RELATIVE = path.join("resources", "glm", "zcode.cjs");
-const MACOS_CLI_RELATIVE = path.join("Contents", "Resources", "glm", "zcode.cjs");
+// 与 cli-locate.js 的判定保持一致（后者未导出 WIN，这里只用于 spawn 选项）。
+const WIN = process.platform === "win32";
 
 // zcode 支持的权限模式（--mode 的合法取值，与 CLI 帮助一致）。
 // 白名单双重防线：agent 层校验后，这里在 spawn 前再校验一次，
 // 非法值一律回落 yolo，外部输入不可能以任意形态进入命令行。
 const MODES = new Set(["plan", "build", "edit", "guarded", "yolo"]);
 
-/**
- * 安装根候选（按平台，可移植顺序）。
- * 规则：
- * - 环境变量只表达"安装目录"，可执行文件仍由 CLI_RELATIVE 派生，
- *   避免环境变量换掉实际启动的程序；
- * - ZCODE_WINDOWS_APP_INSTALL_DIR 是 ZCode Desktop 注入给子进程的安装目录，
- *   经 env-file 继承后用于非标准安装位置的自适应定位。
- */
-function installRoots() {
-  const roots = [];
-  for (const key of ["ZCODE_HOME", "ZCODE_WINDOWS_APP_INSTALL_DIR"]) {
-    const value = process.env[key];
-    if (typeof value === "string" && value && path.isAbsolute(value)) {
-      roots.push(value);
-    }
-  }
-  if (WIN) {
-    roots.push(
-      path.join(process.env.LOCALAPPDATA ?? "", "Programs", "ZCode"),
-      path.join(process.env.PROGRAMFILES ?? "", "ZCode"),
-    );
-  } else {
-    roots.push("/Applications/ZCode.app");
-  }
-  return roots;
+// stderr 里的噪声行：栈帧，以及崩溃时被打断的压缩 bundle 源码。
+// 压缩源码的可靠特征是「很长却几乎没有空白」（正常错误消息总是有断词的空格）。
+// 长度门槛取 80：低于它的短片段即使来自源码也带不出有效信息，留着无害。
+const SOURCE_NOISE_MIN_LENGTH = 80;
+function isNoiseLine(line) {
+  if (/^\s*at [^()]*(\(.*\))?$/.test(line)) return true;
+  if (line.length < SOURCE_NOISE_MIN_LENGTH) return false;
+  const spaces = (line.match(/\s/g) ?? []).length;
+  return spaces * 20 < line.length;
 }
 
 /**
@@ -57,8 +43,28 @@ function installRoots() {
  */
 function killTree(child) {
   if (WIN) {
-    if (child.pid != null) {
-      execFile("taskkill", ["/pid", String(child.pid), "/T", "/F"], () => {});
+    const pid = child.pid;
+    // pid 由 spawn 返回（内核分配的正整数），非数字时退回单进程 kill。
+    // 用数组形式的参数列表交给 spawn（shell: false，不经任何命令行解释器）；
+    // pid 先转成十进制字符串，字符集封闭为数字，不会被解析成其它选项。
+    if (typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0) {
+      // 先构造完整参数列表再交给 spawn：参数以数组元素传递，不拼接到任何命令行。
+      // pid 已被限定为正安全整数，再显式断言其十进制形态不带前导符号，
+      // 保证 taskkill 收到的永远是纯数字值。（taskkill 不支持 `--` 终止符
+      // 也不支持 `/pid=` 等号形式，实测均报"无效参数/选项"，故只能靠值域保证。）
+      const pidArg = pid.toString(10);
+      if (!/^[0-9]+$/.test(pidArg)) {
+        child.kill();
+        return;
+      }
+      const args = ["/pid", pidArg, "/T", "/F"];
+      const killer = spawn("taskkill", args, {
+        windowsHide: true,
+        stdio: "ignore",
+        shell: false,
+      });
+      // 失败不外抛：taskkill 不存在或进程已退出都不影响后续流程。
+      killer.on("error", () => {});
     } else {
       child.kill();
     }
@@ -71,18 +77,14 @@ function killTree(child) {
   }
 }
 
-/** 只认已存在的普通文件。 */
-function isFile(p) {
-  return Boolean(p) && existsSync(p) && statSync(p).isFile();
-}
-
 /**
  * 补齐 zcode 运行所需的运行时环境。
  *
  * 规则：
  * - env-file 与调用方显式值优先；builtin provider config 未设置时才按安装根兜底；
- * - 不默认注入 ZCODE_DATA_BASE_DIR：它替代的是 homedir，而非 ~/.zcode，
- *   显式设置还会切入受管模式；Desktop 重定向场景仍由 env-file 提供。
+ * - ZCODE_DATA_BASE_DIR 未设置时用 dataBaseDir() 的自动发现结果补上：
+ *   CLI 自身不读 Desktop 的 setting.json，不注入就会退回家目录读到旧配置
+ *   （provider 401）；未重定向时它与 homedir 同值，无副作用。
  *
  * 导出供 login 代理复用（login.js）：与 runTurn 用同一套定位与环境准备。
  * @param {string} [cli] 已解析的 zcode.cjs 路径，用于定位实际安装根。
@@ -90,44 +92,32 @@ function isFile(p) {
 export function applyZcodeRuntimeEnv(env, cli) {
   // Desktop 的认证上下文由使用方导出成 env-file（见 runtime-env.js）。
   mergeRuntimeEnv(env, process.env.ZCODE_ACP_ENV_FILE);
+  if (!env.ZCODE_DATA_BASE_DIR) {
+    const base = dataBaseDir();
+    // 与 homedir 相同表示未重定向，保持不注入（CLI 默认行为即可）。
+    if (base !== homeDir()) env.ZCODE_DATA_BASE_DIR = base;
+  }
   if (cli && !env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE) {
-    // 从 CLI 反推实际安装根，兼容 macOS 的 <bundle>/Contents 布局。
-    const installRoot = path.resolve(path.dirname(cli), "..", "..");
-    const config = path.join(installRoot, "config", "provider", "zcode-builtin.json");
-    if (isFile(config)) env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = config;
+    const config = builtinProviderConfigAt(cli);
+    if (config) env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = config;
   }
 }
 
-/**
- * 解析出可执行的 (node, cli) 组合。
- * 规则：
- * - cli 固定为安装根下的平台对应路径，必须真实存在；
- * - macOS 优先标准 Contents/Resources 布局，回退裸 bundle 的 resources 布局；
- * - node 固定为字面量 "node"（交给 PATH 解析）。
- */
-export function resolveZcode() {
-  const roots = installRoots();
-  const relativeCliPaths = WIN ? [CLI_RELATIVE] : [MACOS_CLI_RELATIVE, CLI_RELATIVE];
-  const cli = roots
-    .flatMap((root) => relativeCliPaths.map((relative) => path.join(root, relative)))
-    .find(isFile);
-  if (!cli) {
-    throw new Error(
-      "找不到 zcode.cjs。请先安装 ZCode Desktop（zcode CLI 随其发行），" +
-        "或把环境变量 ZCODE_HOME 指向 ZCode 安装目录",
-    );
-  }
-  return { node: "node", cli };
-}
+// 兜底解析的原始输出上限：命令类输出是一个小 JSON 文档，超限即判定不是该形态。
+const MAX_RAW_OUTPUT = 1024 * 1024;
 
 /**
  * 读取 zcode 的 stream-json 事件流并逐条回调。
  * 之所以按行解析：zcode 的 stdout 是 NDJSON，一行一个事件对象。
+ * 返回原始输出取值函数：内置斜杠命令（/goal 等）不产生 NDJSON，整段 stdout
+ * 是一个普通 JSON 文档，收尾时要从这里兜底解析。
  */
 function onNdjsonStream(readable, onEvent) {
   let buffer = "";
+  let raw = "";
   readable.setEncoding("utf8");
   readable.on("data", (chunk) => {
+    if (raw.length < MAX_RAW_OUTPUT) raw = (raw + chunk).slice(0, MAX_RAW_OUTPUT);
     buffer += chunk;
     let nl = buffer.indexOf("\n");
     while (nl >= 0) {
@@ -143,6 +133,29 @@ function onNdjsonStream(readable, onEvent) {
       nl = buffer.indexOf("\n");
     }
   });
+  return () => raw;
+}
+
+/**
+ * 解析命令类输出：zcode 的内置斜杠命令（实测 /goal）在 headless 下会以与
+ * `--output-format json` 同形的整段 JSON 文档输出，而不是 NDJSON 事件流。
+ *
+ * 规则：
+ * - 只取 response 作为回显文本；**不取其中的 sessionId**——实测那是命令执行时
+ *   的临时会话，拿它 --resume 会报 "Session not found"，续接必须沿用原会话；
+ * - 不是该形态（空输出、NDJSON 事件流、缺 response）时返回 null。
+ */
+export function parseCommandOutput(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{")) return null;
+  let doc;
+  try {
+    doc = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!doc || typeof doc !== "object" || typeof doc.response !== "string") return null;
+  return { response: doc.response };
 }
 
 /**
@@ -155,18 +168,50 @@ function onNdjsonStream(readable, onEvent) {
  *   MODES 白名单（plan/build/edit/guarded/yolo 之一），缺省 yolo 与 zcode
  *   对 --prompt 的默认一致（headless 无确认入口）。
  * - cwd 是本地归一化后的绝对路径。
+ * - attachments 是本进程自己写的临时文件（见 runTurn），同样用等号形式绑定，
+ *   每个附件一个 `--attach=`，避免路径以 `-` 开头时被当成选项。
  */
-function buildArgs({ cli, text, cwd, resume, mode }) {
+function buildArgs({ cli, text, cwd, resume, mode, attachments }) {
+  // 所有可变值都以 `--opt=<值>` 的单个 argv 出现（等号绑定）：即使值以 `-` 开头，
+  // 也只能作为该选项的值被消费，不可能变成独立选项。配合 spawn 的数组传参
+  //（shell: false），用户输入无法逃逸为选项或命令。
   return [
     cli,
     `--prompt=${text}`,
     "--output-format",
     "stream-json",
-    "--cwd",
-    cwd,
+    `--cwd=${cwd}`,
     `--mode=${mode}`,
-    ...(resume ? ["--resume", resume] : []),
+    ...(resume ? [`--resume=${resume}`] : []),
+    ...(attachments ?? []).map((file) => `--attach=${file}`),
   ];
+}
+
+/**
+ * 从 stderr 提取可读的错误摘要。
+ *
+ * 规则：
+ * - zcode 崩溃时会把被打断的那行 bundle 源码（数 KB 单行）一并打进 stderr，
+ *   原样转给用户完全不可读，因此优先只取 `Error:` / `SdkError:` 行；
+ * - 没有错误行时退回尾部上下文：丢弃超长行与栈帧/源码特征行，
+ *   并把 `providerXxx:` 这类结构化字段前置（provider 报错的真正原因都在这里）；
+ * - 保留较多行是因为 401 / 认证类错误需要上下文才能定位。
+ */
+export function summarizeStderr(stderr) {
+  const lines = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const errors = [...new Set(lines.filter((line) => /^(Sdk)?Error: /.test(line)))];
+  if (errors.length > 0) return errors.slice(0, 5).join("\n");
+
+  // 没有 Error: 行时（provider 报错、崩溃中途被打断的 bundle 源码）挑可读的尾部行：
+  // 丢掉压缩源码与栈帧，优先保留 provider* 结构化字段，
+  // 否则客户端里看到的会是一屏源码而不是错误原因。
+  const readable = lines.filter((line) => line.length <= 300 && !isNoiseLine(line));
+  const providerLines = readable.filter((line) => /^provider[A-Za-z]*:/.test(line));
+  const rest = readable.filter((line) => !providerLines.includes(line));
+  return [...providerLines, ...rest].slice(-20).join("\n");
 }
 
 /**
@@ -187,9 +232,14 @@ function buildArgs({ cli, text, cwd, resume, mode }) {
  *   默认模型与默认思考级别（见 models.js）
  * @param {(stop: () => void) => void} opts.onStart 子进程启动后交回控柄
  * @param {(e: object) => void} opts.onEvent 每个 stream-json 事件回调
+ * @param {string} [opts.envelope] 上下文文本（MiCO 任务模板），写入本轮临时附件
+ *   后经 `--attach` 交给 CLI：附件进模型上下文，但不进会话标题与首条消息
  * @returns {Promise<{sessionId?: string, content?: string, error?: string, cancelled?: boolean}>}
  */
-export function runTurn({ cwd, text, resume, mode, model, onStart, onEvent }) {
+export function runTurn({ cwd, text, resume, mode, model, envelope, onStart, onEvent }) {
+  // 用户输入的唯一入口：只接受字符串。下游把它拼进 `--prompt=<值>` 单个 argv
+  //（见 buildArgs），非字符串会让拼接结果形态不可控，这里直接拒绝。
+  if (typeof text !== "string") throw new TypeError("runTurn: text 必须是字符串");
   const { node, cli } = resolveZcode();
   // spawn 前的白名单门卫：只放行枚举内的已知模式。
   const safeMode = MODES.has(mode) ? mode : "yolo";
@@ -203,8 +253,28 @@ export function runTurn({ cwd, text, resume, mode, model, onStart, onEvent }) {
     if (copy) env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = copy;
   }
 
+  // 上下文附件：写到本轮独享临时目录，进程结束后整目录删除。
+  // 写失败不阻断执行——退回把文本拼进 prompt 会让标题变脏，但功能优先。
+  const attachmentDir = typeof envelope === "string" && envelope.trim()
+    ? mkdtempSync(path.join(tmpdir(), "zcode-acp-context-"))
+    : null;
+  const attachments = [];
+  if (attachmentDir) {
+    const file = path.join(attachmentDir, "context.md");
+    writeFileSync(file, envelope, "utf8");
+    attachments.push(file);
+  }
+  const cleanup = () => {
+    if (!attachmentDir) return;
+    try {
+      rmSync(attachmentDir, { recursive: true, force: true });
+    } catch {
+      // Windows 上子进程刚退出时句柄可能还没释放，留给系统临时目录清理。
+    }
+  };
+
   return new Promise((resolve) => {
-    const child = spawn(node, buildArgs({ cli, text, cwd, resume, mode: safeMode }), {
+    const child = spawn(node, buildArgs({ cli, text, cwd, resume, mode: safeMode, attachments }), {
       cwd,
       env,
       windowsHide: true,
@@ -220,6 +290,8 @@ export function runTurn({ cwd, text, resume, mode, model, onStart, onEvent }) {
     const finish = (result) => {
       if (settled) return;
       settled = true;
+      // 临时上下文附件只服务本轮进程，收尾时一并删除（含所有提前返回路径）。
+      cleanup();
       resolve(result);
     };
 
@@ -228,11 +300,16 @@ export function runTurn({ cwd, text, resume, mode, model, onStart, onEvent }) {
       killTree(child);
     });
 
-    onNdjsonStream(child.stdout, (event) => {
+    const rawOutput = onNdjsonStream(child.stdout, (event) => {
       if (event.sessionId) zcodeSessionId = event.sessionId;
       if (event.type === "session.updated" && typeof event.payload?.content === "string") {
         // 每轮结束时 zcode 会发一条 payload.content 完整回复。
         content = event.payload.content;
+      }
+      // 内置斜杠命令（/compact 等）不发 payload.content，回复只在末尾 result 行的
+      // response 字段；正常轮次没有 content 时用它兜底，两者内容一致。
+      if (event.type === "result" && typeof event.response === "string" && content === undefined) {
+        content = event.response;
       }
       onEvent(event);
     });
@@ -255,22 +332,27 @@ export function runTurn({ cwd, text, resume, mode, model, onStart, onEvent }) {
     child.on("close", (code) => {
       if (cancelled) {
         finish({ sessionId: zcodeSessionId, cancelled: true });
-      } else if (content !== undefined) {
-        finish({ sessionId: zcodeSessionId, content });
-      } else {
-        // 保留较多行：zcode 的 401/认证类错误需要上下文才能定位。
-        const tail = stderr.trim().split("\n").slice(-40).join("\n");
-        // 认证过期最常见（ZCode Desktop 重启会换 token），给出可执行的修复指引，
-        // 用户在客户端里直接能看到，不用翻日志。
-        const authHint = /API Key 不存在|invalid_key|statusCode: 401/.test(stderr)
-          ? "\n\n>>> 认证已过期或未登录。请执行 zcode-acp login 重新登录后重试。"
-          : "";
-        const ctx = `[debug] cwd=${cwd} HOME=${env.HOME ?? "(unset)"} cli=${cli} node=${node}`;
-        finish({
-          sessionId: zcodeSessionId,
-          error: `zcode 退出码 ${code}\n${ctx}${tail ? `\n${tail}` : ""}${authHint}`,
-        });
+        return;
       }
+      // 正常轮次取 session.updated 的完整回复；命令类轮次取末尾 result 行，
+      // 再不济按整段 JSON 文档兜底（/goal 等不产出任何 NDJSON 事件）。
+      const reply = content ?? parseCommandOutput(rawOutput())?.response;
+      if (reply !== undefined) {
+        finish({ sessionId: zcodeSessionId, content: reply });
+        return;
+      }
+      // 保留较多行：zcode 的 401/认证类错误需要上下文才能定位。
+      const tail = summarizeStderr(stderr);
+      // 认证过期最常见（ZCode Desktop 重启会换 token），给出可执行的修复指引，
+      // 用户在客户端里直接能看到，不用翻日志。
+      const authHint = /API Key 不存在|invalid_key|statusCode: 401/.test(stderr)
+        ? "\n\n>>> 认证已过期或未登录。请执行 zcode-acp login 重新登录后重试。"
+        : "";
+      const ctx = `[debug] cwd=${cwd} HOME=${env.HOME ?? env.USERPROFILE ?? "(unset)"} cli=${cli} node=${node}`;
+      finish({
+        sessionId: zcodeSessionId,
+        error: `zcode 退出码 ${code}\n${ctx}${tail ? `\n${tail}` : ""}${authHint}`,
+      });
     });
   });
 }

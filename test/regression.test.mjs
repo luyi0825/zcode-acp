@@ -1,19 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { findModel, listModels, writeSelectionConfig } from "../src/models.js";
 import {
   assistantUsageOf,
   createSemanticStream,
+  createUsageLedger,
   effortLevelsForModel,
   modelUsageOf,
   reasoningLevelForEffort,
   usageOf,
 } from "../src/claude.js";
-import { readRuntimeEnvFile } from "../src/runtime-env.js";
-import { applyZcodeRuntimeEnv } from "../src/zcode.js";
+import { readRuntimeEnvFile, personalProviderConfigPath, builtinProviderConfigAt } from "../src/runtime-env.js";
+import { applyZcodeRuntimeEnv, parseCommandOutput, summarizeStderr } from "../src/zcode.js";
+import { splitTaskEnvelope } from "../src/prompt-envelope.js";
+import { rewriteSkillCommand } from "../src/slash-text.js";
+import { resolveZcode } from "../src/cli-locate.js";
 
 function makeTempDir(t) {
   const dir = mkdtempSync(path.join(tmpdir(), "zcode-acp-regression-"));
@@ -313,6 +317,7 @@ test("usageOfTranslatesZcodeUsageToClaudeFields", () => {
     type: "session.updated",
     payload: {
       usage: JSON.stringify({ inputTokens: 27743, outputTokens: 201, cacheReadTokens: 19200 }),
+      contextWindow: 200000,
     },
   });
   assert.deepEqual(usage, {
@@ -321,20 +326,38 @@ test("usageOfTranslatesZcodeUsageToClaudeFields", () => {
     cache_read_input_tokens: 19200,
   });
   // 已解析成对象时同样接受。
-  assert.deepEqual(usageOf({ type: "session.updated", payload: { usage: { inputTokens: 5, outputTokens: 1 } } }), {
-    input_tokens: 5,
-    output_tokens: 1,
-  });
+  assert.deepEqual(
+    usageOf({ type: "session.updated", payload: { usage: { inputTokens: 5, outputTokens: 1 }, contextWindow: 1 } }),
+    { input_tokens: 5, output_tokens: 1 },
+  );
   // 缓存大于输入（异常数据）时 input 归零而不是负数。
   assert.deepEqual(
-    usageOf({ type: "session.updated", payload: { usage: { inputTokens: 10, cacheReadTokens: 99 } } }),
+    usageOf({
+      type: "session.updated",
+      payload: { usage: { inputTokens: 10, cacheReadTokens: 99 }, contextWindow: 1 },
+    }),
     { input_tokens: 0, cache_read_input_tokens: 99 },
   );
   // 无 usage / 非法 JSON / 非 session.updated 一律返回 null，不能中断执行。
-  assert.equal(usageOf({ type: "session.updated", payload: {} }), null);
-  assert.equal(usageOf({ type: "session.updated", payload: { usage: "{bad" } }), null);
-  assert.equal(usageOf({ type: "model.streaming", payload: { usage: "{}" } }), null);
-  assert.equal(usageOf({ type: "session.updated", payload: { usage: { inputTokens: -1 } } }), null);
+  assert.equal(usageOf({ type: "session.updated", payload: { contextWindow: 1 } }), null);
+  assert.equal(usageOf({ type: "session.updated", payload: { usage: "{bad", contextWindow: 1 } }), null);
+  assert.equal(usageOf({ type: "model.streaming", payload: { usage: "{}", contextWindow: 1 } }), null);
+  assert.equal(
+    usageOf({ type: "session.updated", payload: { usage: { inputTokens: -1 }, contextWindow: 1 } }),
+    null,
+  );
+  // 每次请求结束有两条载荷相同的 session.updated（一条仅 usage、一条轮末汇总），
+  // 只有带 contextWindow 的轮末那条计入，否则每次请求的用量会记两遍。
+  const body = { inputTokens: 27743, outputTokens: 201, cacheReadTokens: 19200 };
+  const counted = [
+    { type: "session.updated", payload: { usage: JSON.stringify(body) } },
+    { type: "session.updated", payload: { usage: JSON.stringify(body), contextWindow: 200000 } },
+  ]
+    .map(usageOf)
+    .filter(Boolean);
+  assert.deepEqual(counted, [
+    { input_tokens: 8543, output_tokens: 201, cache_read_input_tokens: 19200 },
+  ]);
 });
 
 // 一个 turn 内多次模型请求各自计费：inputTokens 是每次请求的完整输入，必须累加。
@@ -344,7 +367,10 @@ test("usageOfAccumulatesPerRequest", () => {
     { inputTokens: 27743, outputTokens: 201, cacheReadTokens: 19200 },
     { inputTokens: 28612, outputTokens: 366, cacheReadTokens: 27648 },
   ].reduce((sum, body) => {
-    const usage = usageOf({ type: "session.updated", payload: { usage: JSON.stringify(body) } });
+    const usage = usageOf({
+      type: "session.updated",
+      payload: { usage: JSON.stringify(body), contextWindow: 200000 },
+    });
     const merged = { ...sum };
     for (const [key, value] of Object.entries(usage)) merged[key] = (merged[key] ?? 0) + value;
     return merged;
@@ -355,6 +381,74 @@ test("usageOfAccumulatesPerRequest", () => {
     cache_read_input_tokens: 46848,
   });
 });
+
+// 宿主（MiCO Claude 适配器）对每条 assistant 消息按 message.id 建账后跨消息求和：
+// 每份用量必须恰好挂到一条 assistant 消息上。把整轮累计挂到每条消息（旧实现）
+// 会让多工具轮的用量成倍虚高。
+test("usageLedgerAttachesEachRequestOnce", () => {
+  const ledger = createUsageLedger();
+  const assistant = { type: "assistant", message: { role: "assistant", content: [] } };
+  const toolResult = {
+    type: "user",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "" }] },
+  };
+  // 请求 1 结束，请求 2 期间无 assistant 消息（工具结果都是 user 消息）：
+  // 两份用量都攒在 pending，挂到下一条 assistant 消息时合并成一份。
+  ledger.add({ input_tokens: 100, output_tokens: 1 });
+  ledger.add({ input_tokens: 23, output_tokens: 2 });
+  assert.deepEqual(ledger.take(toolResult), null);
+  assert.deepEqual(ledger.take(assistant), { input_tokens: 123, output_tokens: 3 });
+  // 挂过即清：同轮后续 assistant 消息不能再挂（宿主按消息求和会翻倍）。
+  assert.equal(ledger.pending(), false);
+  assert.deepEqual(ledger.take(assistant), null);
+  // 请求 3 的量挂下一条；total 始终是整轮累计（result 行口径）。
+  ledger.add({ input_tokens: 7 });
+  assert.deepEqual(ledger.take(assistant), { input_tokens: 7 });
+  assert.deepEqual(ledger.total(), { input_tokens: 130, output_tokens: 3 });
+});
+
+// 模拟真实工具轮的完整时序：请求 N 的 usage 在其输出消息之后才到达，因此挂账
+// 对象是「下一条」assistant 消息；每份请求的量恰好挂一次，加总等于整轮累计。
+test("usageLedgerMatchesToolTurnTimeline", () => {
+  const ledger = createUsageLedger();
+  const newAssistant = () => ({ type: "assistant", message: { role: "assistant", content: [] } });
+  const toolResult = { type: "user", message: { role: "user", content: [] } };
+  const attached = [];
+  const emit = (semantic) => {
+    const usage = ledger.take(semantic);
+    if (usage) attached.push(usage);
+  };
+  // 请求 1：tool_use 消息先出（pending 为空不挂），usage 随轮末事件后到。
+  emit(newAssistant());
+  ledger.add({ input_tokens: 100, output_tokens: 10 });
+  emit(toolResult);
+  // 请求 2：tool_use 消息挂走请求 1 的量，自己的量留给下一条。
+  emit(newAssistant());
+  ledger.add({ input_tokens: 200, output_tokens: 20 });
+  emit(toolResult);
+  // 请求 3（收尾文本）：保活 flush 把文本提前发出，挂走请求 2 的量；
+  // 随后到达的请求 3 usage 没有后续消息可挂，pending 保持非空。
+  emit(newAssistant());
+  ledger.add({ input_tokens: 50, output_tokens: 5 });
+  assert.deepEqual(attached, [
+    { input_tokens: 100, output_tokens: 10 },
+    { input_tokens: 200, output_tokens: 20 },
+  ]);
+  // 收尾兜底：空 content 的 assistant 消息把最后一份量挂出，不漏计。
+  assert.equal(ledger.pending(), true);
+  emit(newAssistant());
+  assert.deepEqual(attached.at(-1), { input_tokens: 50, output_tokens: 5 });
+  // 三份请求的量各挂一次，加总等于整轮累计（result 行口径）。
+  assert.deepEqual(sumUsage(attached), ledger.total());
+});
+
+function sumUsage(list) {
+  return list.reduce((sum, usage) => {
+    const merged = { ...sum };
+    for (const [key, value] of Object.entries(usage)) merged[key] = (merged[key] ?? 0) + value;
+    return merged;
+  }, {});
+}
 
 test("emitSemanticAttachesUsageToAssistantMessages", () => {
   // 宿主按消息 id 逐条聚合 token（MiCO 侧为 assistantUsageByID），usage 必须挂在
@@ -417,6 +511,50 @@ test("configurationPathsRejectParentTraversal", (t) => {
   assert.equal(listModels()?.availableModels.length, 1);
 });
 
+test("builtinProviderConfigRejectsParentTraversal", (t) => {
+  // builtin 配置同样来自环境变量，穿越形态必须与 personal 一样被拒绝：
+  // 否则能借它读到模型清单之外的任意 JSON。
+  const dir = makeTempDir(t);
+  isolateEnv(t, [
+    "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+    "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+    "ZCODE_DATA_BASE_DIR",
+  ]);
+  const dataDir = path.join(dir, "data");
+  writeFixture(
+    path.join(dataDir, ".zcode", "v2", "provider_config.json"),
+    JSON.stringify({
+      config: {
+        providerOrder: ["p1"],
+        providerConfigRules: {
+          providerRules: [{ providerId: "p1", config: { modelOrder: ["m-hidden", "m-live"] } }],
+        },
+      },
+    }),
+  );
+  process.env.ZCODE_DATA_BASE_DIR = dataDir;
+
+  // 穿越路径指向的 builtin 配置会禁用 m-live；若被采用，模型列表会只剩 m-hidden。
+  const builtin = path.join(dir, "nested", "zcode-builtin.json");
+  writeFixture(
+    builtin,
+    JSON.stringify({
+      config: {
+        modelConfigRules: {
+          modelRules: [{ modelMatch: "m-live", config: { enabled: false } }],
+        },
+      },
+    }),
+  );
+  const traversing = `${path.join(dir, "nested")}${path.sep}..${path.sep}nested${path.sep}zcode-builtin.json`;
+  process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = traversing;
+
+  // 穿越被拒后回退到安装根派生（本测试环境没有安装根，等价于没有 builtin 配置），
+  // 因此两个模型都应在列表里 —— 证明穿越值没有被采用。
+  const models = listModels();
+  assert.equal(models.availableModels.length, 2);
+});
+
 test("resolveZcodePrefersMacContentsAndFallsBack", async (t) => {
   const dir = makeTempDir(t);
   isolateEnv(t, ["ZCODE_HOME", "ZCODE_WINDOWS_APP_INSTALL_DIR"]);
@@ -439,6 +577,33 @@ test("resolveZcodePrefersMacContentsAndFallsBack", async (t) => {
   assert.equal(resolveZcode().cli, bareCli);
 });
 
+test("resolveZcodeSkipsRegistryWhenEnvPathHits", (t) => {
+  // 注册表查询要起 reg 子进程（几十毫秒），只在标准候选全落空时才该发生。
+  // 用注入的假 reg 证明：环境变量命中时它一次都不被调用。
+  const dir = makeTempDir(t);
+  isolateEnv(t, ["ZCODE_HOME", "ZCODE_WINDOWS_APP_INSTALL_DIR"]);
+  const installRoot = path.join(dir, "Zcode");
+  const cli = path.join(installRoot, "resources", "glm", "zcode.cjs");
+  writeFixture(cli);
+  process.env.ZCODE_HOME = installRoot;
+
+  const marker = path.join(dir, "reg-was-called");
+  const fakeReg = path.join(dir, "reg");
+  // 假 reg：被调用就留下标记文件，然后以非零码退出（模拟「注册表里没有 ZCode」）。
+  writeFixture(
+    fakeReg,
+    `#!${process.execPath}\nrequire("node:fs").writeFileSync(${JSON.stringify(marker)}, "");\nprocess.exit(1);\n`,
+  );
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${dir}${path.delimiter}${savedPath ?? ""}`;
+  t.after(() => {
+    process.env.PATH = savedPath;
+  });
+
+  assert.equal(resolveZcode().cli, cli);
+  assert.equal(existsSync(marker), false, "命中环境变量路径时不应查询注册表");
+});
+
 test("applyZcodeRuntimeEnvInjectsBuiltinProviderFallback", (t) => {
   const dir = makeTempDir(t);
   isolateEnv(t, ["ZCODE_ACP_ENV_FILE", "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"]);
@@ -458,7 +623,201 @@ test("applyZcodeRuntimeEnvInjectsBuiltinProviderFallback", (t) => {
   assert.equal(explicitEnv.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE, explicit);
 });
 
-test("applyZcodeRuntimeEnvDoesNotInjectDataBaseDirByDefault", (t) => {
+test("builtinProviderConfigAtFindsWindowsResourcesLayout", (t) => {
+  // Windows/Linux 布局是 <安装根>/resources/glm/zcode.cjs，配置在
+  // <安装根>/resources/config/provider/ 下（曾按 CLI 上两级推导，少一层 resources）。
+  const dir = makeTempDir(t);
+  const cli = path.join(dir, "Zcode", "resources", "glm", "zcode.cjs");
+  const config = path.join(dir, "Zcode", "resources", "config", "provider", "zcode-builtin.json");
+  writeFixture(cli);
+  writeFixture(config, "{}");
+  assert.equal(builtinProviderConfigAt(cli), config);
+  assert.equal(builtinProviderConfigAt(), undefined);
+});
+
+test("listModelsFallsBackToInstallRootBuiltinConfig", (t) => {
+  // 未设 ZCODE_BUILTIN_PROVIDER_CONFIG_FILE 时也要按安装根取 builtin 配置，
+  // 否则 enabled/disabled 与思考档位会与子进程实际行为不一致。
+  const dir = makeTempDir(t);
+  isolateEnv(t, [
+    "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+    "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+    "ZCODE_HOME",
+    "ZCODE_WINDOWS_APP_INSTALL_DIR",
+  ]);
+  const dataDir = path.join(dir, "data");
+  writeFixture(
+    path.join(dataDir, ".zcode", "v2", "provider_config.json"),
+    JSON.stringify({
+      config: {
+        providerOrder: ["p1"],
+        providerConfigRules: {
+          providerRules: [
+            { providerId: "p1", config: { modelOrder: ["m-disabled", "m-live"] } },
+          ],
+        },
+      },
+    }),
+  );
+  process.env.ZCODE_DATA_BASE_DIR = dataDir;
+
+  const installRoot = path.join(dir, "Zcode");
+  writeFixture(path.join(installRoot, "resources", "glm", "zcode.cjs"));
+  writeFixture(
+    path.join(installRoot, "resources", "config", "provider", "zcode-builtin.json"),
+    JSON.stringify({
+      config: {
+        modelConfigRules: {
+          modelRules: [
+            { modelMatch: "m-disabled", config: { enabled: false } },
+            {
+              modelMatch: "m-live",
+              config: { optionSpecs: { reasoningLevel: { values: ["low", "high", "max"] } } },
+            },
+          ],
+        },
+      },
+    }),
+  );
+  process.env.ZCODE_WINDOWS_APP_INSTALL_DIR = installRoot;
+
+  const models = listModels();
+  assert.equal(models.availableModels.length, 1);
+  assert.equal(models.availableModels[0].name.startsWith("m-live"), true);
+  assert.deepEqual(models.availableModels[0].reasoningLevels, ["low", "high", "max"]);
+});
+
+test("parseCommandOutputReadsCommandJsonDocument", () => {
+  // /goal 在 headless 下不发 NDJSON，整段 stdout 是一个普通 JSON 文档。
+  const doc = JSON.stringify({
+    sessionId: "sess_123",
+    traceId: "trace_1",
+    response: "No goal is set. Use /goal <objective> to set one.",
+  });
+  // 只取回显文本：其中的 sessionId 是命令的临时会话，不可 resume（实测 Session not found）。
+  assert.deepEqual(parseCommandOutput(`\n${doc}\n`), {
+    response: "No goal is set. Use /goal <objective> to set one.",
+  });
+});
+
+test("parseCommandOutputRejectsNonCommandShapes", () => {
+  // NDJSON 事件流、空输出、缺少 response 的 JSON 都不是命令类形态，返回 null。
+  assert.equal(parseCommandOutput('{"type":"result","response":"ok"}\n{"type":"x"}\n'), null);
+  assert.equal(parseCommandOutput("   "), null);
+  assert.equal(parseCommandOutput('{"sessionId":"sess_1"}'), null);
+  assert.equal(parseCommandOutput("not json"), null);
+});
+
+test("parseCommandOutputIgnoresTrailingNdjsonLines", () => {
+  // /compact 走 NDJSON，结果在末尾 result 行（由 runTurn 的 result 分支处理）；
+  // 整段解析必须失败返回 null，不能把半截事件当成命令文档。
+  const mixed = [
+    '{"type":"session.updated","payload":{}}',
+    '{"type":"result","response":"Summary: ok"}',
+  ].join("\n");
+  assert.equal(parseCommandOutput(mixed), null);
+});
+
+test("summarizeStderrKeepsErrorLinesOnly", () => {
+  // zcode 崩溃时会把被打断的 bundle 源码整行打进 stderr，必须过滤掉，
+  // 否则客户端里看到的是一屏压缩源码而不是错误信息。
+  const stderr = [
+    "Error: Select a model before sending a message (traceId: abc)",
+    `,(e.stderr==="pipe"||e.stderr==="overlapped")&&(this._stderrStream=new vEo.PassThrough)}${"x".repeat(500)}`,
+    "SdkError: Version negotiation probe failed: Connection closed",
+    "    at classifyNetworkError (zcode.cjs:2300:78579)",
+  ].join("\n");
+  const summary = summarizeStderr(stderr);
+  assert.match(summary, /Select a model before sending/);
+  assert.match(summary, /Version negotiation probe failed/);
+  assert.ok(!summary.includes("PassThrough"), summary);
+});
+
+test("summarizeStderrFallsBackToTailLines", () => {
+  // 没有 Error: 行时保留尾部可读内容，仍要丢掉超长源码行。
+  const stderr = `${"y".repeat(400)}\nzcode 退出码 1\n最后一行`;
+  const summary = summarizeStderr(stderr);
+  assert.match(summary, /zcode 退出码 1/);
+  assert.match(summary, /最后一行/);
+  assert.ok(!summary.includes("yyyy"), summary);
+});
+
+// MiCO 派发的固定信封；首条输入原文会被 CLI 当成会话标题，故用真实形态做用例。
+const MICO_ENVELOPE = [
+  "## Task Initiator",
+  "",
+  "This task was initiated by **邹翔宇** (zouxiangyu@xiaomi.com), a member of this workspace.",
+  "",
+  "Artifact directory for this turn: `C:/tmp/mico-task/artifacts/`.",
+  "",
+  "[user message=27da3833-0b39-4b3f-9d9d-cda2f484fd24 version=1]",
+  "你好",
+  "",
+  "",
+  "## Human interaction",
+  "",
+  "Make progress with the assignment and available evidence.",
+].join("\n");
+
+test("splitTaskEnvelopeSeparatesUserTextFromTemplate", () => {
+  // 标题取 prompt 正文：模板必须离开正文，否则 ZCode 项目列表显示的是模板首行。
+  const { prompt, envelope } = splitTaskEnvelope(MICO_ENVELOPE);
+  assert.equal(prompt, "你好");
+  assert.ok(envelope && !envelope.includes("你好"), envelope);
+});
+
+test("splitTaskEnvelopeKeepsEnvelopeContent", () => {
+  // 拆出去不等于丢弃：发起人、产物目录、交互规则都要原样进附件。
+  const { envelope } = splitTaskEnvelope(MICO_ENVELOPE);
+  assert.match(envelope, /This task was initiated by \*\*邹翔宇\*\*/);
+  assert.match(envelope, /Artifact directory for this turn: `C:\/tmp\/mico-task\/artifacts\/`\./);
+  assert.match(envelope, /## Human interaction/);
+  assert.match(envelope, /Make progress with the assignment and available evidence\./);
+});
+
+test("splitTaskEnvelopePassesThroughPlainInput", () => {
+  // 非模板输入一律原样下发，不能因为通用文本里出现类似结构就被改写。
+  assert.deepEqual(splitTaskEnvelope("只回复 PONG"), { prompt: "只回复 PONG", envelope: null });
+  const notEnvelope = "## 我的笔记\n[user message=x version=1]\n正文";
+  assert.deepEqual(splitTaskEnvelope(notEnvelope), { prompt: notEnvelope, envelope: null });
+});
+
+test("splitTaskEnvelopeKeepsTemplateOnlyMessage", () => {
+  // 纯模板消息没有用户原话：拆解会让 prompt 变空，故整体按原样下发。
+  const templateOnly = "## Task Initiator\n[user message=x version=1]\n## Human interaction\n规则";
+  assert.deepEqual(splitTaskEnvelope(templateOnly), { prompt: templateOnly, envelope: null });
+});
+
+test("splitTaskEnvelopeKeepsSkillCommandOnFirstLine", () => {
+  // 拆开后用户的斜杠命令回到首行，紧随其后的改写才能真正命中。
+  const wrapped = MICO_ENVELOPE.replace("你好", "/cross-cr 检查这段代码");
+  const { prompt } = splitTaskEnvelope(wrapped);
+  assert.equal(prompt, "/cross-cr 检查这段代码");
+  const rewritten = rewriteSkillCommand(prompt, { skills: new Set(["cross-cr"]), commands: new Set() });
+  assert.equal(rewritten, "/skill cross-cr 检查这段代码");
+});
+
+test("summarizeStderrFiltersBundledSourceNoise", () => {
+  // 实测现场：provider 报错时 stderr 混入崩溃中途的压缩 bundle 源码与栈帧，
+  // providerMessage 才是真正的原因，必须留下来，源码不能占位。
+  const stderr = [
+    "[debug] cwd=C:\\x HOME=C:\\y cli=D:\\zcode\\resources\\glm\\zcode.cjs node=node",
+    'ffer=new wAn({maxBufferSize:e.maxBufferSize}),(e.stderr==="pipe"||e.stderr==="overlapped")&&this._stderrStream=new vEo.PassThrough)}async start(){if(!this._proc',
+    "    at classifyNetworkError (zcode.cjs:2300:78579)",
+    "  providerKind: 'openai-compatible',",
+    "  providerMessage: 'API Key 不存在',",
+  ].join("\n");
+  const summary = summarizeStderr(stderr);
+  assert.match(summary, /providerMessage: 'API Key 不存在'/, summary);
+  assert.match(summary, /providerKind: 'openai-compatible'/, summary);
+  assert.ok(!summary.includes("PassThrough"), summary);
+  assert.ok(!summary.includes("maxBufferSize"), summary);
+  assert.ok(!summary.includes("classifyNetworkError"), summary);
+  // 结构化字段要排在上下文之前，避免被尾部截断挤掉。
+  assert.ok(summary.indexOf("providerMessage") < summary.indexOf("[debug]"), summary);
+});
+
+test("applyZcodeRuntimeEnvInjectsDataBaseDirOnlyWhenRedirected", (t) => {
   const dir = makeTempDir(t);
   isolateEnv(t, ["ZCODE_ACP_ENV_FILE", "ZCODE_DATA_BASE_DIR", "HOME", "USERPROFILE"]);
   mkdirSync(path.join(dir, ".zcode"));
@@ -466,13 +825,111 @@ test("applyZcodeRuntimeEnvDoesNotInjectDataBaseDirByDefault", (t) => {
   process.env.USERPROFILE = dir;
   process.env.ZCODE_ACP_ENV_FILE = path.join(dir, "missing.env");
 
+  // 未重定向（setting.json 不存在）：不注入，交给 CLI 默认行为。
   const env = {};
   applyZcodeRuntimeEnv(env);
   assert.equal(env.ZCODE_DATA_BASE_DIR, undefined);
 
+  // env-file 显式给出重定向值：原样继承。
   const redirected = path.join(dir, "desktop-home");
   writeFixture(process.env.ZCODE_ACP_ENV_FILE, `ZCODE_DATA_BASE_DIR=${redirected}\n`);
   const desktopEnv = {};
   applyZcodeRuntimeEnv(desktopEnv);
   assert.equal(desktopEnv.ZCODE_DATA_BASE_DIR, redirected);
+});
+
+test("applyZcodeRuntimeEnvDiscoversDataBaseDirFromSettingFile", (t) => {
+  // Desktop 重定向数据目录后，非 Desktop 终端里只能靠 setting.json 发现；
+  // CLI 自身不读它，因此必须由 bridge 注入，否则会读到家目录下的旧配置（401）。
+  const dir = makeTempDir(t);
+  isolateEnv(t, ["ZCODE_ACP_ENV_FILE", "ZCODE_DATA_BASE_DIR", "HOME", "USERPROFILE"]);
+  process.env.HOME = dir;
+  process.env.USERPROFILE = dir;
+  process.env.ZCODE_ACP_ENV_FILE = path.join(dir, "missing.env");
+
+  const redirected = path.join(dir, "redirected-data");
+  mkdirSync(redirected, { recursive: true });
+  writeFixture(
+    path.join(dir, ".zcode", "v2", "setting.json"),
+    JSON.stringify({ dataBaseDir: redirected }),
+  );
+
+  const env = {};
+  applyZcodeRuntimeEnv(env);
+  assert.equal(env.ZCODE_DATA_BASE_DIR, path.normalize(redirected));
+});
+
+test("redirectedDataBaseDirRejectsUnsafeValues", (t) => {
+  // setting.json 是本机文件但仍按不可信输入处理：非法形态一律忽略。
+  const dir = makeTempDir(t);
+  isolateEnv(t, ["ZCODE_ACP_ENV_FILE", "ZCODE_DATA_BASE_DIR", "HOME", "USERPROFILE"]);
+  process.env.HOME = dir;
+  process.env.USERPROFILE = dir;
+  process.env.ZCODE_ACP_ENV_FILE = path.join(dir, "missing.env");
+  const settingPath = path.join(dir, ".zcode", "v2", "setting.json");
+
+  for (const dataBaseDir of [
+    "relative/path",
+    path.join(dir, "nested", "..", "nested"),
+    path.join(dir, "does-not-exist"),
+    42,
+  ]) {
+    writeFixture(settingPath, JSON.stringify({ dataBaseDir }));
+    const env = {};
+    applyZcodeRuntimeEnv(env);
+    assert.equal(env.ZCODE_DATA_BASE_DIR, undefined, `应拒绝：${String(dataBaseDir)}`);
+  }
+
+  // 损坏的 JSON 同样忽略。
+  writeFixture(settingPath, "{not json");
+  const env = {};
+  applyZcodeRuntimeEnv(env);
+  assert.equal(env.ZCODE_DATA_BASE_DIR, undefined);
+});
+
+test("personalProviderConfigPathFollowsDataBaseDir", (t) => {
+  const dir = makeTempDir(t);
+  isolateEnv(t, ["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", "ZCODE_DATA_BASE_DIR", "HOME", "USERPROFILE"]);
+
+  // 显式设置的值优先，不因数据目录存在而被改写。
+  const explicit = path.join(dir, "custom-provider.json");
+  process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = explicit;
+  process.env.ZCODE_DATA_BASE_DIR = path.join(dir, "data");
+  assert.equal(personalProviderConfigPath(), explicit);
+
+  // 未设置时按数据目录推导，布局与 zcode CLI 一致。
+  delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+  assert.equal(
+    personalProviderConfigPath(),
+    path.join(dir, "data", ".zcode", "v2", "provider_config.json"),
+  );
+
+  // 数据目录也未设置时退回家目录。
+  delete process.env.ZCODE_DATA_BASE_DIR;
+  process.env.USERPROFILE = dir;
+  assert.equal(
+    personalProviderConfigPath(),
+    path.join(dir, ".zcode", "v2", "provider_config.json"),
+  );
+});
+
+test("listModelsDerivesProviderConfigFromDataBaseDir", (t) => {
+  const dir = makeTempDir(t);
+  isolateEnv(t, [
+    "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+    "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+    "ZCODE_DATA_BASE_DIR",
+  ]);
+  const dataDir = path.join(dir, "data");
+  writeFixture(
+    path.join(dataDir, ".zcode", "v2", "provider_config.json"),
+    JSON.stringify({
+      config: {
+        providerOrder: ["p1"],
+        providerConfigRules: { providerRules: [{ providerId: "p1", config: { modelOrder: ["m1"] } }] },
+      },
+    }),
+  );
+  process.env.ZCODE_DATA_BASE_DIR = dataDir;
+  assert.equal(listModels()?.availableModels.length, 1);
 });

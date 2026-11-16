@@ -65,6 +65,21 @@ function flattenDescription(value) {
   return single.length > MAX_DESCRIPTION ? `${single.slice(0, MAX_DESCRIPTION)}…` : single;
 }
 
+// 客户端菜单需要展示、且 headless 下真的会执行的 CLI 内置命令。
+//
+// 背景：`commands list --json` 只返回用户自定义命令，内置命令在 CLI 里是硬编码的、
+// 没有导出接口，因此只能在这里声明。只收录实测在 `-p` 模式下真正执行的两条：
+//   /compact  → 返回 "Context is up to date; no compression needed" 一类结果；
+//   /goal     → 返回 {"response":"No goal is set. Use /goal <objective> to set one."}；
+// 其余内置命令（/model /mode /mcp /plugins /effort /dwf /locale）在 headless 下
+// 不被识别，会被当成普通提示词让模型解释一遍；/workflow /fork 直接退出码 1。
+// 模型、模式、思考级别已由 ACP 的 set_model / set_mode / set_config_option 承担，
+// 不重复进菜单。
+const BUILTIN_COMMANDS = [
+  { name: "compact", description: "压缩当前会话上下文，可附加摘要要求" },
+  { name: "goal", description: "查看或设置当前会话目标" },
+];
+
 // 进程级缓存：这些清单在一次 bridge 生命周期内不会变，而读它们要起子进程，
 // 每个新会话都重读会明显拖慢会话建立。promise 形式保证并发会话共享同一次读取。
 let cached = null;
@@ -73,7 +88,8 @@ let cached = null;
  * 本机可用的命令 / 技能 / 子 agent 清单。
  *
  * 规则：
- * - 命令与技能分开返回，因为调用形式不同：自定义命令是 `/name`，
+ * - commands 含内置命令与自定义命令（内置在前），调用方可一律按「原生命令名」处理；
+ * - 命令与技能分开返回，因为调用形式不同：命令是 `/name`，
  *   **技能必须 `/skill <name>`**——实测裸写技能名得到 "Unknown command"，
  *   CLI 的斜杠注册表只含自定义命令；
  * - 重名时命令优先于技能（裸 `/name` 命中的是命令），与 CLI 自身优先级一致；
@@ -89,9 +105,10 @@ export function discoverCapabilities() {
 async function discoverOnce() {
   const [commandsOut, skillsOut] = await Promise.all([fetchCommands(), fetchSkills()]);
 
-  const commands = [];
-  const commandNames = new Set();
-  // 自定义命令优先：重名时先加入的留下，与 CLI 自身优先级一致。
+  // 内置命令排在自定义命令之前：它们的名字占用后，同名的自定义项与技能都不再
+  // 视为「命令」，从而不会被 rewriteSkillCommand 改写成 /skill（内置命令永远优先）。
+  const commands = BUILTIN_COMMANDS.map((command) => ({ ...command }));
+  const commandNames = new Set(BUILTIN_COMMANDS.map((command) => command.name));
   for (const command of parseJson(commandsOut)?.commands ?? []) {
     const name = typeof command?.name === "string" ? command.name.trim() : "";
     if (!name || commandNames.has(name)) continue;
@@ -103,7 +120,7 @@ async function discoverOnce() {
   const skillNames = new Set(commandNames);
   for (const skill of parseJson(skillsOut)?.skills ?? []) {
     const name = String(skill?.qualifiedName ?? skill?.name ?? "").trim();
-    // 与自定义命令同名时以命令为准：裸 `/name` 命中的是命令，技能需 /skill 前缀区分。
+    // 与命令同名时以命令为准：裸 `/name` 命中的是命令，技能需 /skill 前缀区分。
     if (!name || skillNames.has(name)) continue;
     skillNames.add(name);
     skills.push({ name, description: flattenDescription(skill?.description) });
@@ -116,7 +133,7 @@ async function discoverOnce() {
  * 斜杠命令清单（ACP AvailableCommand 形态）。
  *
  * 规则：
- * - 自定义命令以 `/<name>` 出现；
+ * - commands 已含内置命令（见 BUILTIN_COMMANDS）与自定义命令，内置在前；
  * - 技能也进这个菜单（`/<name>` 形式）：ACP 客户端只会展示这份清单里的条目，
  *   不放进来用户在 OpenIdea / Zed / Mutica 里根本看不到技能，也就无从调用；
  *   实测 `/技能名` 裸写会被 zcode 判为 "Unknown command"，但因为它的 `Skill`

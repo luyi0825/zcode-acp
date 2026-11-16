@@ -16,12 +16,30 @@ const AGENT_COMMAND = "zcode-acp";
 
 /**
  * 把环境值限定在指定父目录内的绝对路径（拼接固定文件名）。
- * 防御：外部可控的目录值不允许经 `..` 逃出父目录。
+ *
+ * 规则：
+ * - parentDir 本身来自环境变量（APPDATA / XDG_CONFIG_HOME / HOME），按不可信
+ *   输入处理：必须是绝对路径且路径段不含 `..`，否则返回 null——只约束
+ *   「不逃出 parentDir」不够，受污染的 parentDir 会把写入引到任意位置；
+ * - 拼接后的结果必须仍在 parentDir 之下。
  */
 function safeJoin(parentDir, ...segments) {
-  const base = path.normalize(parentDir);
+  const base = normalizeBaseDir(parentDir);
+  if (!base) return null;
   const joined = path.normalize(path.join(base, ...segments));
   return joined.startsWith(base + path.sep) ? joined : null;
+}
+
+/**
+ * 规范化配置根目录；不合格返回 null。
+ *
+ * 规则：必须是绝对路径、路径段不得含 `..`（在 normalize 之前判断，
+ * normalize 会把 `..` 解析掉），返回 normalize 后的路径。
+ */
+function normalizeBaseDir(dir) {
+  if (typeof dir !== "string" || !dir || !path.isAbsolute(dir)) return null;
+  if (dir.split(/[\\/]/).includes("..")) return null;
+  return path.normalize(dir);
 }
 
 /**
@@ -117,14 +135,19 @@ const CLIENTS = [
 /**
  * 向所有已装客户端注册 agent 入口，返回逐客户端结果（已装才登记）。
  *
+ * 规则：appDataDir 来自环境变量，入口处先规范化与校验；不合格直接返回说明文本，
+ * 不进入任何拼接，避免受污染的值把探测与写入引到预期之外的目录。
+ *
  * @param {string} appDataDir 配置根目录（Windows 为 %APPDATA%）
  */
 export function registerAllClients(appDataDir) {
+  const base = normalizeBaseDir(appDataDir);
+  if (!base) return ["[warn] 配置根目录异常（需绝对路径且不含 ..），跳过注册"];
   const results = [];
   for (const client of CLIENTS) {
-    if (!client.detect(appDataDir)) continue;
+    if (!client.detect(base)) continue;
     try {
-      results.push(`[ok] ${client.write(appDataDir)}`);
+      results.push(`[ok] ${client.write(base)}`);
     } catch (err) {
       results.push(`[fail] ${client.name}: ${err instanceof Error ? err.message : String(err)}`);
     }

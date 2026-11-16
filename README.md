@@ -63,10 +63,10 @@ command = 'zcode-acp'
 1. **独立登录（推荐）**：`zcode-acp login` 走浏览器授权（设备授权码轮询，
    无需本地回调），凭据存 `~/.zcode/v2/credentials.json`（AES-256-GCM 加密，
    密钥在 OS keyring）。全程不依赖 ZCode Desktop 运行。
-2. **ZCode Desktop 用户（数据目录被重定向）**：在 Desktop 打开的终端里运行
-   `zcode-acp setup`，自动把 Desktop 签发的运行时变量导出到
-   `~/.zcode-acp.env`（zcode-acp 启动时默认读取）。Desktop 重启后这些变量会更换，
-   届时重新运行一次 `setup` 即可。
+2. **ZCode Desktop 用户（数据目录被重定向）**：在 Desktop 打开的终端里运行一次
+   `zcode-acp setup`，把本机布局（`ZCODE_DATA_BASE_DIR`、安装位置等固定值）导出到
+   `~/.zcode-acp.env`（zcode-acp 启动时默认读取）。**只需跑一次**：这些值不随
+   Desktop 重启变化，只有换数据目录或换安装位置后才需要重跑。
 
 Linux 服务器等无 OS keyring 的环境：设置 `ZCODE_CREDENTIAL_SECRET` 环境变量
 （32–4096 字节的密钥串）后 login。

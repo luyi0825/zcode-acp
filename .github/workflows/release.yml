@@ -33,6 +33,14 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME 与 package.json 版本 $PKG 不一致"
             exit 1
           fi
+          # AGENT_INFO.version 是源码里的第二处版本号（单文件 exe 无法读 package.json），
+          # 漏改会让 --version 输出与实际版本不符，而 --version 正是宿主做 preflight
+          # 判活用的探针，这里一并卡住。
+          AGENT="$(grep -oE 'version: "[0-9]+\.[0-9]+\.[0-9]+"' src/agent.js | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+          if [ "$AGENT" != "$PKG" ]; then
+            echo "::error::src/agent.js 的 AGENT_INFO.version（$AGENT）与 package.json（$PKG）不一致"
+            exit 1
+          fi
 
       # notes 缺失时直接失败：静默回退到自动生成的 commit 列表会丢手写内容。
       - name: 校验 release notes
@@ -47,12 +55,23 @@ jobs:
         id: pack
         run: echo "tgz=$(npm pack --silent | tail -1)" >> "$GITHUB_OUTPUT"
 
+      # 标题放在可选的 docs/releases/<tag>.title（单行）；缺省退回 tag 名。
+      - name: 取 Release 标题
+        id: meta
+        run: |
+          TITLE_FILE="docs/releases/${GITHUB_REF_NAME}.title"
+          TITLE=""
+          if [ -f "$TITLE_FILE" ]; then
+            TITLE="$(head -1 "$TITLE_FILE" | sed 's/[[:space:]]*$//')"
+          fi
+          echo "title=${TITLE:-$GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
       - name: 创建 Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
+            --title "${{ steps.meta.outputs.title }}" \
             --notes-file "docs/releases/${GITHUB_REF_NAME}.md" \
             --verify-tag \
             "${{ steps.pack.outputs.tgz }}"

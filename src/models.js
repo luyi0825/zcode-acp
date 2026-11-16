@@ -9,6 +9,8 @@ import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { builtinProviderConfigAt, personalProviderConfigPath } from "./runtime-env.js";
+import { resolveZcode } from "./cli-locate.js";
 
 // 找不到模型规则时的旧版回退档位。有元数据时使用该模型实际的
 // optionSpecs.reasoningLevel.values，默认级别取末位（实测验证），
@@ -35,29 +37,33 @@ function isFile(p) {
 }
 
 /**
+ * 校验 provider 配置路径并返回规范化结果。
+ *
+ * 规则（与 runtime-env.js 的 env-file 防御一致）：必须是绝对路径，原始路径
+ * 任一段不得为 `..`（禁止目录穿越），且必须是普通文件；不满足返回 null。
+ * 所有把外部路径交给读文件的入口都要先过这里。
+ */
+function configPath(value) {
+  if (typeof value !== "string" || !path.isAbsolute(value)) return null;
+  // 必须在 normalize 之前判断：normalize 会把 `..` 解析掉，之后再也查不到。
+  if (value.split(/[\\/]/).includes("..")) return null;
+  const normalized = path.normalize(value);
+  return isFile(normalized) ? normalized : null;
+}
+
+/**
  * 读取 personal provider config，路径由调用方传入（env-file 继承的
  * ZCODE_PERSONAL_PROVIDER_CONFIG_FILE）。读不到或损坏返回 null，
  * 调用方回退到单模型声明，保证 ACP 链路不断。
- *
- * 规则（与 runtime-env.js 的 env-file 防御一致）：路径必须是绝对路径，
- * 原始路径任一段不得为 `..`（禁止目录穿越），且必须是普通文件。
  */
 function readProviderConfig(filePath) {
-  if (typeof filePath !== "string" || !path.isAbsolute(filePath)) return null;
-  // 必须在 normalize 之前判断：normalize 会把 `..` 解析掉，之后再也查不到。
-  if (filePath.split(/[\\/]/).includes("..")) return null;
-  const normalized = path.normalize(filePath);
-  if (!isFile(normalized)) return null;
+  const normalized = configPath(filePath);
+  if (!normalized) return null;
   try {
     return JSON.parse(readFileSync(normalized, "utf8"));
   } catch {
     return null;
   }
-}
-
-/** 本进程环境中配置的 personal provider config 路径（由 env-file 继承）。 */
-function providerConfigPath() {
-  return process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
 }
 
 /** 模型配置规则数组；配置损坏时按空规则处理，保留调用方的降级路径。 */
@@ -163,13 +169,33 @@ function orderedRules(config) {
 }
 
 /**
+ * 内置 provider 配置（含模型启用状态与思考档位规则）。
+ *
+ * 规则：环境变量优先；未设置时从 zcode CLI 的安装根反推，与 zcode.js
+ * 注入给子进程的路径保持一致——否则本进程算出的模型列表（含 disabled 过滤）
+ * 会与子进程实际行为不符。定位不到返回 null。
+ */
+function builtinProviderConfig() {
+  const explicit = configPath(process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE);
+  if (explicit) return readProviderConfig(explicit);
+  let cli;
+  try {
+    ({ cli } = resolveZcode());
+  } catch {
+    return null;
+  }
+  // builtinProviderConfigAt 只拼接在 CLI 安装根之下，路径来源可信。
+  return readProviderConfig(builtinProviderConfigAt(cli));
+}
+
+/**
  * 真实模型列表（含默认 currentModelId，即 providerOrder[0] 的第一个模型，
  * 与 headless 实测行为一致）。读不到配置返回 null。
  */
 export function listModels() {
-  const config = readProviderConfig(providerConfigPath());
+  const config = readProviderConfig(personalProviderConfigPath());
   if (!config) return null;
-  const builtinConfig = readProviderConfig(process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE);
+  const builtinConfig = builtinProviderConfig();
   const availableModels = [];
   for (const rule of orderedRules(config)) {
     const ids = rule.config.modelOrder ?? rule.config.personalModelIds;
@@ -217,10 +243,10 @@ export function findModel(value) {
  * 规则：
  * - 副本一次性（随机文件名）：同会话串行、跨会话并发都天然安全，
  *   留在临时目录由系统清理；
- * - 不改 apiKey 等其余内容：认证走 ZCODE_OFFICIAL_ENDPOINT，与该文件无关。
+ * - 不改 apiKey 等其余内容：认证走该文件里的 apiKey，副本只是重排顺序。
  */
 export function writeSelectionConfig(selection) {
-  const config = readProviderConfig(providerConfigPath());
+  const config = readProviderConfig(personalProviderConfigPath());
   if (!config) return null;
   let rule;
   let modelId = selection.modelId;
@@ -252,7 +278,7 @@ export function writeSelectionConfig(selection) {
     }
   }
   if (selection.reasoningLevel) {
-    const builtinConfig = readProviderConfig(process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE);
+    const builtinConfig = builtinProviderConfig();
     const { reasoningLevels: levels } = resolveModelConfig(config, builtinConfig, rule, modelId);
     // 找不到既有 modelConfigRules 条目时补一条，保证 optionSpecs 有落点。
     const modelRules = config.config.modelConfigRules?.providerModelRules;

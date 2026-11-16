@@ -8,12 +8,18 @@
 // 首行的斜杠命令形式：/名字 后面可跟参数。
 const LEADING_COMMAND = /^\/([A-Za-z0-9][\w.:@/-]*)([\s\S]*)$/;
 
+// 永远不改写的 CLI 内置命令：它们由 CLI 自己解析，改写成 /skill 会让命令失效。
+// 与 commands.js 的 BUILTIN_COMMANDS 同源，但这里独立兜底——不能依赖调用方
+// 恰好把内置命令也并进 commands 集合。
+const NATIVE_COMMANDS = new Set(["compact", "goal"]);
+
 /**
  * 把整段以 `/技能名` 开头的文本改写为 `/skill 技能名`。
  *
  * 规则：
  * - 只改写**整段开头**的斜杠命令：正文中间提到命令名时不改动；
  * - 名字必须命中本机技能白名单才改写，避免把普通文本误当命令；
+ * - **内置命令永不改写**：/compact、/goal 由 CLI 自行解析；
  * - **同名自定义命令优先，不改写**：一个名字可能既是命令又是技能
  *   （如 cross-cr），此时 `/名字` 命中 CLI 的原生命令，改成 /skill 反而
  *   绕过命令定义、丢失它自带的上下文；
@@ -30,6 +36,7 @@ export function rewriteSkillCommand(text, names) {
   if (!parts) return text;
   const command = parts[1];
   if (command === "skill") return text;
+  if (NATIVE_COMMANDS.has(command)) return text;
   // 同名命令优先：CLI 会把 /名字 当命令执行，技能要靠模型自行加载。
   if (names.commands?.has(command)) return text;
   if (!names.skills.has(command)) return text;

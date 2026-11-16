@@ -2,7 +2,7 @@
 // session/new / session/prompt 流式文本 / 多轮续接 / cancel / 模型选择 / 思考级别 /
 // 权限模式 / 通用客户端注册器。
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { registerAllClients } from "../src/register.js";
@@ -109,8 +109,9 @@ function runClaude(args, message) {
 }
 
 const client = startClient();
-const textOf = () =>
+const textOf = (from = 0) =>
   client.updates
+    .slice(from)
     .filter((u) => u.sessionUpdate === "agent_message_chunk")
     .map((u) => u.content.text)
     .join("");
@@ -142,12 +143,30 @@ try {
 
   // 3. 第一轮：验证流式文本
   writeFileSync(path.join(cwd, "note.txt"), "alpha-7731 is the code word\n");
+  // 3a. 同会话并发：两条 prompt 必须串行，后者被 refusal 挡下。
+  //     必须放在本进程的第一次 prompt 上：串行占位要在 await knownNames() 之前
+  //     同步完成，而首次命令发现实测耗时 1.7s，是真实存在的竞争窗口；
+  //     缓存建立后再测就撞不上这个窗口，也测不出回归。
+  const firstPrompt = client.request("session/prompt", {
+    sessionId,
+    prompt: [{ type: "text", text: "Count slowly from 1 to 100, one number per line." }],
+  });
+  const racedResult = await client.request("session/prompt", {
+    sessionId,
+    prompt: [{ type: "text", text: "say hi" }],
+  });
+  check("同会话并发 prompt 被拒绝", racedResult.stopReason === "refusal", JSON.stringify(racedResult));
+  client.notify("session/cancel", { sessionId });
+  await firstPrompt;
+  const afterRace = client.updates.length;
+
   const r1 = await client.request("session/prompt", {
     sessionId,
     prompt: [{ type: "text", text: "Read note.txt and reply with only the code word." }],
   });
   check("第一轮 stopReason=end_turn", r1.stopReason === "end_turn", JSON.stringify(r1));
-  check("第一轮流式产出包含 alpha-7731", textOf().includes("alpha-7731"), JSON.stringify(textOf()));
+  // 从并发轮次之后切片：那轮的长文本不能算进本轮断言。
+  check("第一轮流式产出包含 alpha-7731", textOf(afterRace).includes("alpha-7731"), JSON.stringify(textOf(afterRace)));
 
   // 4. 第二轮：验证 --resume 续接（不再给文件内容，只能靠上下文）
   const before = client.updates.length;
@@ -403,6 +422,25 @@ try {
   registerAllClients(fakeAppData);
   const zedAgain = readFileSync(path.join(fakeAppData, "Zed", "settings.json"), "utf8");
   check("Zed 重复注册幂等", (zedAgain.match(/"zcode"/g) ?? []).length === 1, zedAgain);
+
+  // 12b. 配置根目录来自环境变量（APPDATA / XDG_CONFIG_HOME / HOME），按不可信输入处理：
+  //      只保证「不逃出父目录」不够——受污染的父目录会把探测与写入引到任意位置。
+  //      不能经 path.join 构造：它自身会先规范化，`..` 不会留在字符串里。
+  const escapeDir = `${fakeAppData}${path.sep}nested${path.sep}..${path.sep}nested`;
+  for (const [label, badDir] of [
+    ["含 .. 的配置根被拒绝", escapeDir],
+    ["相对路径配置根被拒绝", "relative/appdata"],
+    ["空配置根被拒绝", ""],
+  ]) {
+    const before = readdirSync(fakeAppData).sort().join(",");
+    const rejected = registerAllClients(badDir);
+    const after = readdirSync(fakeAppData).sort().join(",");
+    check(
+      label,
+      rejected.length === 1 && rejected[0].startsWith("[warn]") && before === after,
+      JSON.stringify({ rejected, before, after }),
+    );
+  }
 // 13. 工具卡片 / diff / 计划面板：zcode 的工具事件是 tool.updated 的
   //     scheduled → started → result 三段（流里没有顶层 tool_call），
   //     这三段必须翻译成 ACP 的 tool_call + tool_call_update，否则客户端什么都看不到。
@@ -519,6 +557,8 @@ try {
     JSON.stringify(toolUpdates.filter((u) => String(u.sessionUpdate).startsWith("tool")).slice(0, 3)),
   );
   // 15. Mutica Claude 协议：真实启动参数 → init / assistant / result，并校验档位映射。
+  //     用两次 Read 触发 3 次模型请求，校验 usage 口径：宿主按 assistant 消息求和，
+  //     每份请求用量必须恰好挂一条消息（旧实现挂整轮累计会翻倍，成对 usage 事件会再翻倍）。
   const claudeModelId = models.availableModels?.[1]?.modelId ?? firstModel?.modelId ?? "claude-sonnet-4-6";
   const claudeRun = await runClaude(
     [
@@ -536,12 +576,19 @@ try {
     ],
     {
       type: "user",
-      message: { role: "user", content: [{ type: "text", text: "Reply with only: PONG" }] },
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "First read probe.txt with the Read tool, then read note.txt with the Read tool. Finally reply with only the two code words, separated by a single space.",
+          },
+        ],
+      },
       session_id: "",
     },
   );
   const claudeInit = claudeRun.events.find((event) => event.type === "system" && event.subtype === "init");
-  const claudeAssistant = claudeRun.events.find((event) => event.type === "assistant");
   const claudeResult = claudeRun.events.find((event) => event.type === "result");
   check(
     "Claude stream-json 返回 init 与 session_id",
@@ -549,12 +596,38 @@ try {
     JSON.stringify(claudeRun.events).slice(0, 500),
   );
   check(
-    "Claude stream-json 返回 PONG 与成功 result",
+    "Claude stream-json 返回两个 code word 与成功 result",
     claudeRun.code === 0 &&
-      claudeAssistant?.message?.content?.[0]?.text === "PONG" &&
-      claudeResult?.result === "PONG" &&
+      claudeResult?.result?.includes("probe-4412") &&
+      claudeResult.result.includes("alpha-7731") &&
       claudeResult.is_error === false,
     JSON.stringify({ code: claudeRun.code, stderr: claudeRun.stderr, result: claudeResult }).slice(0, 800),
+  );
+  // usage 断言：result.usage 四档为正；assistant 消息逐条 usage 求和必须等于总量。
+  const sumUsage = (list) =>
+    list.reduce((sum, usage) => {
+      const merged = { ...sum };
+      for (const [key, value] of Object.entries(usage)) merged[key] = (merged[key] ?? 0) + value;
+      return merged;
+    }, {});
+  const assistantUsages = claudeRun.events
+    .filter((event) => event.type === "assistant" && event.message?.usage)
+    .map((event) => event.message.usage);
+  const usageSum = sumUsage(assistantUsages);
+  check(
+    "Claude result 行携带正向 usage 与 modelUsage",
+    (claudeResult?.usage?.input_tokens ?? 0) > 0 &&
+      (claudeResult.usage.output_tokens ?? 0) > 0 &&
+      Object.values(claudeResult.modelUsage ?? {}).length === 1,
+    JSON.stringify({ usage: claudeResult?.usage, modelUsage: claudeResult?.modelUsage }),
+  );
+  check(
+    "Claude assistant 消息 usage 求和等于 result 总量",
+    assistantUsages.length > 0 &&
+      usageSum.input_tokens === claudeResult.usage.input_tokens &&
+      usageSum.output_tokens === claudeResult.usage.output_tokens &&
+      (usageSum.cache_read_input_tokens ?? 0) === (claudeResult.usage.cache_read_input_tokens ?? 0),
+    JSON.stringify({ usageSum, resultUsage: claudeResult?.usage, attached: assistantUsages.length }),
   );
   check(
     "Claude 与 ZCode 使用同名思考档位",
@@ -641,6 +714,36 @@ try {
     new Set(slashCommands.map((c) => c.name)).size === slashCommands.length,
   );
 
+  // 17a. 内置命令必须进菜单：`commands list --json` 只返回自定义命令，
+  //      内置命令在 CLI 里硬编码、无导出接口，只能由 bridge 声明。
+  //      只收录实测在 headless 下真正执行的两条（/compact、/goal）。
+  for (const name of ["compact", "goal"]) {
+    const entry = slashCommands.find((c) => c.name === name);
+    check(
+      `内置命令 /${name} 出现在菜单`,
+      Boolean(entry && entry.description),
+      JSON.stringify(entry),
+    );
+  }
+  // 内置命令必须排在自定义命令之前，且同名自定义项不能挤掉它。
+  check(
+    "内置命令排在菜单最前",
+    slashCommands[0]?.name === "compact" && slashCommands[1]?.name === "goal",
+    JSON.stringify(slashCommands.slice(0, 3).map((c) => c.name)),
+  );
+  // 内置命令不能被技能改写规则误改成 /skill（否则内置命令失效）。
+  const { rewriteSkillCommand: rewriteForBuiltin } = await import("../src/slash-text.js");
+  const shadowed = { skills: new Set(["goal", "compact"]) };
+  check(
+    "同名技能不劫持内置命令",
+    rewriteForBuiltin("/goal", shadowed) === "/goal" &&
+      rewriteForBuiltin("/compact", shadowed) === "/compact",
+    JSON.stringify({
+      goal: rewriteForBuiltin("/goal", shadowed),
+      compact: rewriteForBuiltin("/compact", shadowed),
+    }),
+  );
+
   // 17b. 技能必须进客户端菜单（否则 OpenIdea / Zed / Mutica 里根本看不到、点不到），
   //      且技能名改写要遵守「同名命令优先」——cross-cr 既是命令又是技能，
   //      改成 /skill 会绕过命令自带上下文。
@@ -676,6 +779,26 @@ try {
     "正文中提到的技能名不被篡改",
     rewriteSkillCommand(`请解释 /${skillOnly?.name ?? "x"} 的用途`, knownNames) ===
       `请解释 /${skillOnly?.name ?? "x"} 的用途`,
+  );
+
+  // 17c. 内置斜杠命令（/goal、/compact）不产生 model.streaming 事件，回复只在
+  //      runTurn 的 content 里。bridge 必须把它补发给客户端，否则一轮结束客户端
+  //      什么都看不到。/goal 不触发模型调用，适合作为端到端验收项。
+  const builtinSession = await client.request("session/new", { cwd, mcpServers: [] });
+  const builtinBefore = client.updates.length;
+  const builtinResult = await client.request("session/prompt", {
+    sessionId: builtinSession.sessionId,
+    prompt: [{ type: "text", text: "/goal" }],
+  });
+  const builtinText = client.updates
+    .slice(builtinBefore)
+    .filter((u) => u.sessionUpdate === "agent_message_chunk")
+    .map((u) => u.content?.text ?? "")
+    .join("");
+  check(
+    "内置命令 /goal 回复送达客户端",
+    builtinResult.stopReason === "end_turn" && builtinText.includes("goal"),
+    JSON.stringify({ stopReason: builtinResult.stopReason, text: builtinText.slice(0, 200) }),
   );
 
   // 18. initialize 的 authMethods 必须非空（ACP Registry 上架校验项）

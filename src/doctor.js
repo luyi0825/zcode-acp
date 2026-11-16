@@ -4,11 +4,17 @@
 // --probe 额外实跑一轮 headless 冒烟。
 // setup 在 doctor 之上：Desktop 环境里导出认证 env-file，并打印各客户端接入片段。
 import { existsSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { resolveZcode, runTurn } from "./zcode.js";
 import { listModels } from "./models.js";
-import { defaultEnvFile, loadDefaultRuntimeEnv, RUNTIME_ENV_KEYS } from "./runtime-env.js";
+import {
+  dataBaseDir,
+  defaultEnvFile,
+  loadDefaultRuntimeEnv,
+  personalProviderConfigPath,
+  RUNTIME_ENV_KEYS,
+} from "./runtime-env.js";
 import { registerAllClients } from "./register.js";
 
 /**
@@ -46,7 +52,7 @@ export async function runDoctor({ probe = false } = {}) {
 
   // 3. 登录态：凭据路径与 zcode CLI 的规则一致
   //（<ZCODE_DATA_BASE_DIR 或 home>/.zcode/v2/credentials.json）。
-  const credPath = path.join(process.env.ZCODE_DATA_BASE_DIR ?? homedir(), ".zcode", "v2", "credentials.json");
+  const credPath = path.join(dataBaseDir(), ".zcode", "v2", "credentials.json");
   if (existsSync(credPath)) ok(`已登录（凭据：${credPath}）`);
   else warn(`未登录（${credPath} 不存在）。执行 zcode-acp login 登录；纯 api-key 配置可忽略`);
 
@@ -57,7 +63,7 @@ export async function runDoctor({ probe = false } = {}) {
     const more = models.availableModels.length > 3 ? " 等" : "";
     ok(`模型 ${models.availableModels.length} 个（${names}${more}）`);
   } else {
-    bad("读不到模型列表：personal provider config 缺失或损坏（登录后由 zcode 生成）");
+    bad(`读不到模型列表：${personalProviderConfigPath()} 缺失或损坏（登录后由 zcode 生成）`);
   }
 
   // 5. --probe：实跑一轮
@@ -78,11 +84,15 @@ export async function runDoctor({ probe = false } = {}) {
 
 /**
  * 把当前 shell 里的 ZCode 运行时变量导出到默认 env-file。
- * 仅在检测到 Desktop 签发的 endpoint 时执行（这些变量只有 ZCode Desktop
- * 打开的终端里才有）；返回导出的键数量，不适合导出时返回 -1。
+ *
+ * 规则：
+ * - 这些值都是本机布局（数据目录、安装位置），跑一次长期有效，
+ *   只有换数据目录或换安装位置才需要重跑；
+ * - 不导出 ZCODE_OFFICIAL_ENDPOINT / TOKEN：它们每次 Desktop 重启都换，
+ *   且普通对话的 provider 认证不依赖它们；
+ * - 没有任何可导出项时返回 -1。
  */
 function exportRuntimeEnvFile() {
-  if (!process.env.ZCODE_OFFICIAL_ENDPOINT) return -1;
   const entries = RUNTIME_ENV_KEYS.filter((key) => process.env[key]).map(
     (key) => `${key}=${process.env[key]}`,
   );
@@ -91,27 +101,29 @@ function exportRuntimeEnvFile() {
   return entries.length;
 }
 
-/** setup：自检 + Desktop 环境导出 + 向已装客户端自动注册。 */
+/** setup：自检 + 运行时环境导出 + 向已装客户端自动注册。 */
 export async function runSetup() {
   const healthy = await runDoctor();
   console.log();
 
   const exported = exportRuntimeEnvFile();
   if (exported >= 0) {
-    console.log(`已导出认证环境（${exported} 项）到 ${defaultEnvFile()}`);
-    console.log("注意：ZCode Desktop 重启后 endpoint/token 会更换，届时重新运行 setup。");
-  } else if (process.env.ZCODE_OFFICIAL_ENDPOINT === undefined) {
-    console.log("当前终端不是 ZCode Desktop 会话，跳过认证环境导出（独立 login 用户无需此步）。");
+    console.log(`已导出本机布局（${exported} 项）到 ${defaultEnvFile()}`);
+    console.log("这些值长期有效，仅在更换数据目录或安装位置后需要重新运行 setup。");
   } else {
-    console.warn("检测到 Desktop 环境但没有可导出的变量，请在 ZCode Desktop 打开的终端里运行 setup。");
+    console.warn("没有可导出的运行时变量，跳过导出。");
   }
 
   // 通用注册：向本机所有已装的 ACP 客户端写入 agent 入口（客户端发现制，
   // 模式对齐 Claude 生态）。未装的客户端自动跳过。
   console.log("\n注册到本机 ACP 客户端：");
-  const appDataDir = process.env.APPDATA ?? process.env.HOME;
+  // Windows 的客户端配置根是 APPDATA；HOME 在 Windows 上通常指向别处（或不存在），
+  // 拿它当回退会去错误目录找客户端，静默得到「未检测到」。
+  const appDataDir = process.platform === "win32"
+    ? process.env.APPDATA
+    : process.env.XDG_CONFIG_HOME ?? process.env.HOME;
   if (!appDataDir) {
-    console.warn("  [warn] 找不到配置目录（APPDATA/HOME 均未设置），跳过注册");
+    console.warn("  [warn] 找不到配置目录（APPDATA / HOME 均未设置），跳过注册");
   } else {
     const results = registerAllClients(appDataDir);
     if (results.length === 0) {

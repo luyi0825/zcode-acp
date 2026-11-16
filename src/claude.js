@@ -6,9 +6,15 @@ import { loadDefaultRuntimeEnv } from "./runtime-env.js";
 import { findModel, listModels, REASONING_LEVELS } from "./models.js";
 import { discoverCapabilities } from "./commands.js";
 import { rewriteSkillCommand } from "./slash-text.js";
+import { splitTaskEnvelope } from "./prompt-envelope.js";
 import { runTurn } from "./zcode.js";
 
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
+// 未选模型时的占位名：ZCode headless 没有 --model 参数，实际用的是 provider
+// 配置里的默认模型。这个值只作为协议字段的占位与 modelUsage 的 key，
+// 不借用任何真实模型名，避免宿主把它当成真实模型展示或落库。
+const ZCODE_DEFAULT_MODEL = "zcode";
 
 /** Mutica 与 ZCode 使用同名档位；开关型配置不伪装成强度滑块。 */
 export function effortLevelsForModel(reasoningLevels = REASONING_LEVELS) {
@@ -37,7 +43,7 @@ async function knownNames() {
 }
 
 function parseArgs(args) {
-  const options = { model: "zcode", mode: "yolo", resume: undefined, effort: undefined };
+  const options = { model: ZCODE_DEFAULT_MODEL, mode: "yolo", resume: undefined, effort: undefined };
   for (let index = 0; index < args.length; index++) {
     const value = args[index + 1];
     switch (args[index]) {
@@ -107,7 +113,9 @@ function addUsage(base, extra) {
  * 取一次模型请求的 token 用量。
  *
  * 规则：
- * - zcode 每次请求结束发一条 session.updated，payload.usage 是 JSON 字符串而非对象；
+ * - zcode 每次请求结束发**成对**的 session.updated：一条仅含 usage，一条是带
+ *   usage + contextWindow + content 的轮末汇总，两者载荷相同；只认带 contextWindow
+ *   的那条（与 ACP 路径 map-event.js 的判别一致），两条都认会把每次请求记两遍；
  * - 该次 inputTokens 是这次请求的完整输入，属于独立计费量，多次请求需累加；
  * - zcode 的 inputTokens **含缓存**（inputTokenDetails = noCache + cacheRead + cacheWrite），
  *   而 Claude 的 input_tokens 不含缓存，故扣减后上报，避免宿主把缓存重复计入；
@@ -115,8 +123,9 @@ function addUsage(base, extra) {
  */
 export function usageOf(event) {
   if (event?.type !== "session.updated") return null;
-  const raw = event.payload?.usage;
-  if (raw == null) return null;
+  const payload = event.payload;
+  if (payload?.usage == null || payload?.contextWindow == null) return null;
+  const raw = payload.usage;
   let usage;
   try {
     usage = typeof raw === "string" ? JSON.parse(raw) : raw;
@@ -267,18 +276,50 @@ export function assistantUsageOf(semantic, usage) {
   return semantic?.type === "assistant" ? usage : null;
 }
 
-/** 发一条语义消息：补齐 id / session_id / uuid，宿主只认完整形态。 */
+/**
+ * 每轮的 token 账本：total 是整轮累计（result 行的上报口径），pending 是尚未
+ * 挂到 assistant 消息的累计（宿主 MiCO 按消息 id 建账、跨消息求和的口径）。
+ *
+ * 规则：
+ * - 每次请求的 usage 进 pending，挂到下一条 assistant 语义消息后清空——宿主对
+ *   不同消息 id 各自建账再求和，把整轮累计挂到每条消息会重复计费；
+ * - 两次请求之间没有 assistant 消息时（如工具轮的收尾文本）pending 继续累加，
+ *   保证每份用量恰好挂一次；
+ * - 只有 assistant 消息挂 usage，工具结果（user 消息）不计费。
+ */
+export function createUsageLedger() {
+  let total;
+  let pending;
+  return {
+    /** 整轮累计（result 行的 usage / modelUsage 口径）。 */
+    total: () => total,
+
+    /** 是否还有未挂出的用量（收尾兜底用）。 */
+    pending: () => Boolean(pending),
+
+    /** 记一次模型请求的用量。 */
+    add(turnUsage) {
+      total = addUsage(total, turnUsage);
+      pending = addUsage(pending, turnUsage);
+    },
+
+    /** 取语义消息应挂的 usage；挂出即清空 pending，null 表示该消息不挂。 */
+    take(semantic) {
+      const attached = assistantUsageOf(semantic, pending);
+      if (attached) pending = undefined;
+      return attached;
+    },
+  };
+}
+
+/** 发一条语义消息：补齐 id / session_id / uuid，宿主只认完整形态；usage 为已判定的挂载值。 */
 function emitSemantic(sessionId, modelName, semantic, usage) {
   if (!semantic) return;
   const message =
     semantic.type === "assistant"
       ? { id: randomUUID(), type: "message", model: modelName, ...semantic.message }
       : semantic.message;
-  // Claude Code 把每轮 token 用量挂在 assistant 消息的 message.usage 上，宿主按
-  // 消息 id 逐条聚合（MiCO 侧即 assistantUsageByID）；只在末尾 result 里发总量，
-  // 宿主逐条累加时拿不到任何一条，统计恒为 0。
-  const attached = assistantUsageOf(semantic, usage);
-  if (attached) message.usage = attached;
+  if (usage) message.usage = usage;
   emit({
     type: semantic.type,
     message,
@@ -291,15 +332,17 @@ function emitSemantic(sessionId, modelName, semantic, usage) {
 function discoveryModels() {
   const models = listModels();
   if (!models) {
-    // 配置不可读时保留一个可运行的回退项，实际执行仍使用 ZCode 默认模型。
+    // 配置不可读时保留一个可运行的占位项，实际执行仍使用 ZCode 默认模型。
+    // 占位名不借用任何真实模型名（曾写 claude-sonnet-4-6），否则宿主会把它
+    // 当成真实模型展示与按模型落库；档位能力也不声明，避免宣称不存在的支持。
     return [
       {
-        value: "claude-sonnet-4-6",
-        resolvedModel: "claude-sonnet-4-6",
+        value: ZCODE_DEFAULT_MODEL,
+        resolvedModel: ZCODE_DEFAULT_MODEL,
         displayName: "ZCode 默认模型",
         description: "ZCode 当前默认模型（Claude 协议兼容）",
-        supportsEffort: true,
-        supportedEffortLevels: ["low", "medium", "high"],
+        supportsEffort: false,
+        supportedEffortLevels: [],
         supportsAdaptiveThinking: false,
         supportsThinkingOff: false,
       },
@@ -462,21 +505,24 @@ export async function startClaude(args) {
     let model = null;
     if (selection) model = { ...selection, reasoningLevel };
     else if (reasoningLevel) model = { reasoningLevel };
-    // Mutica 下发的 `/技能名` 要改写成 `/skill 技能名`：裸写会被 CLI 判为未知命令。
-    const commandText = rewriteSkillCommand(text, await knownNames());
+    // 先拆 MiCO 信封（用户原话留作正文、模板走附件），再改写 `/技能名`：
+    // 改写只认首行斜杠命令，被模板裹住时永远命不中，拆开后用户的斜杠命令才回到首行。
+    const split = splitTaskEnvelope(text);
+    const commandText = rewriteSkillCommand(split.prompt, await knownNames());
     const startedAt = Date.now();
     const semantics = createSemanticStream();
-    // zcode 每次模型请求发一条带 usage 的 session.updated；该次 inputTokens 是这次请求的
-    // 完整输入，多次请求各自计费，整轮累加才是这轮真实消耗（结果的 usage 上报口径）。
-    let usage;
+    // usage 账本：result 行上报整轮累计；assistant 消息按「每请求一份、挂过即清」
+    // 挂账——宿主（MiCO Claude 适配器）按消息 id 求和，两种口径不能混用。
+    const ledger = createUsageLedger();
+    const emitTurn = (semantic) => emitSemantic(sessionId, options.model, semantic, ledger.take(semantic));
     // 保活：长任务在两次工具调用之间可能长时间没有语义事件，宿主会判死。
-    const keepalive = setInterval(() => {
-      emitSemantic(sessionId, options.model, semantics.flush(), usage);
-    }, SEMANTIC_KEEPALIVE_MS);
+    const keepalive = setInterval(() => emitTurn(semantics.flush()), SEMANTIC_KEEPALIVE_MS);
     keepalive.unref();
     const result = await runTurn({
       cwd: process.cwd(),
       text: commandText,
+      // MiCO 模板走附件：进模型上下文，但不进会话标题与首条消息。
+      envelope: split.envelope,
       resume: options.resume,
       mode: options.mode,
       model,
@@ -489,28 +535,29 @@ export async function startClaude(args) {
           emitInit();
         }
         const turnUsage = usageOf(event);
-        if (turnUsage) usage = addUsage(usage, turnUsage);
-        emitSemantic(sessionId, options.model, semantics.consume(event), usage);
+        if (turnUsage) ledger.add(turnUsage);
+        emitTurn(semantics.consume(event));
       },
     }).finally(() => clearInterval(keepalive));
     emitInit();
 
     const content = result.error ?? result.content ?? "";
     // 收尾：先吐最后一段未发出的文本，避免结尾回复丢失。
-    emitSemantic(sessionId, options.model, semantics.flush(), usage);
+    emitTurn(semantics.flush());
     // 正常路径下文本已随语义消息分段发出，整段再发一次会让宿主侧回复重复；
     // 只有全程没有任何增量事件（老版本 CLI 或纯错误）时才回退成整段发出。
     if (content && (result.error || !semantics.produced())) {
-      emitSemantic(
-        sessionId,
-        options.model,
-        {
-          type: "assistant",
-          message: { role: "assistant", content: [{ type: "text", text: content }] },
-        },
-        usage,
-      );
+      emitTurn({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: content }] },
+      });
     }
+    // 兜底：文本已被保活 flush 提前发完时，最后到达的 usage 没有消息可挂；
+    // 空 content 的 assistant 消息宿主同样按 message.usage 建账，补一条避免漏计。
+    if (ledger.pending()) {
+      emitTurn({ type: "assistant", message: { role: "assistant", content: [] } });
+    }
+    const usage = ledger.total();
     emit({
       type: "result",
       subtype: "success",
@@ -521,7 +568,7 @@ export async function startClaude(args) {
       num_turns: 1,
       // Claude Code 的 result 同时带 usage 与 modelUsage（按模型分组，字段为驼峰）。
       // 宿主按模型落库走 modelUsage，只发 usage 会让 per-model 统计落空。
-      ...(usage ? { usage, modelUsage: { [options.model ?? "zcode"]: modelUsageOf(usage) } } : {}),
+      ...(usage ? { usage, modelUsage: { [options.model ?? ZCODE_DEFAULT_MODEL]: modelUsageOf(usage) } } : {}),
     });
     if (result.error) process.exitCode = 1;
   } catch (error) {

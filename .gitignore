@@ -8,3 +8,5 @@ build/*.exe
 .mimosa
 .openidea
 mydoc
+# ZCode 插件运行时写的本地路径记录，与源码无关
+.v2c/

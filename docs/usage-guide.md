@@ -1,7 +1,7 @@
 # zcode-acp 使用指南
 
 面向使用者的接入手册：安装、接入 OpenIDEA、验证与排障。
-对应 `@luyi0825/zcode-acp` 0.5.4；最后更新：2026-11-16。
+对应 `@luyi0825/zcode-acp` 0.5.5；最后更新：2026-11-16。
 
 zcode-acp 把 [ZCode](https://zcode.z.ai) CLI 包装成 **ACP v1 agent**，让 ACP 客户端把 ZCode 当作自己的编码 agent：
 
@@ -26,8 +26,8 @@ zcode-acp 只做协议翻译；工具、技能、MCP、多轮上下文等 agent 
 再用 npm 从本地安装：
 
 ```bash
-npm install -g ./luyi0825-zcode-acp-0.5.4.tgz
-zcode-acp --version    # 输出版本号（当前 0.5.4）即安装成功
+npm install -g ./luyi0825-zcode-acp-0.5.5.tgz
+zcode-acp --version    # 输出版本号（当前 0.5.5）即安装成功
 ```
 
 ## 3. 登录与认证
@@ -41,7 +41,7 @@ zcode-acp logout             # 退出登录
 ```
 
 - 凭据存 `~/.zcode/v2/credentials.json`（AES-256-GCM 加密，密钥存 OS keyring）。
-- **ZCode Desktop 用户（数据目录被重定向）**：在 Desktop 打开的终端里运行 `zcode-acp setup`，自动把 Desktop 签发的运行时变量导出到 `~/.zcode-acp.env`（zcode-acp 启动时默认读取）。Desktop 重启后这些变量会更换，届时重新运行一次 `setup`。该文件含动态认证信息，不要分享或提交到仓库。
+- **ZCode Desktop 用户（数据目录被重定向）**：在 Desktop 打开的终端里运行一次 `zcode-acp setup`，把本机布局（`ZCODE_DATA_BASE_DIR`、安装位置等固定值）导出到 `~/.zcode-acp.env`（zcode-acp 启动时默认读取）。**只需跑一次**：这些值不随 Desktop 重启变化，只有换数据目录或换安装位置后才需要重跑。
 - 无 OS keyring 的环境（如 Linux 服务器）：先设置 `ZCODE_CREDENTIAL_SECRET`（32–4096 字节的密钥串）再 login。
 
 ## 4. 自检

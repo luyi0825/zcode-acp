@@ -11,10 +11,11 @@ import { eventToUpdates } from "./map-event.js";
 import { attachClient, emitAvailableCommands, emitText, emitUpdate } from "./emitter.js";
 import { discoverCapabilities, listSlashCommands } from "./commands.js";
 import { rewriteSkillCommand } from "./slash-text.js";
+import { splitTaskEnvelope } from "./prompt-envelope.js";
 import { loadDefaultRuntimeEnv } from "./runtime-env.js";
 import { encodeModelId, findModel, isKnownReasoningLevel, listModels, REASONING_LEVELS } from "./models.js";
 
-export const AGENT_INFO = { name: "zcode-acp", title: "ZCode", version: "0.5.4" };
+export const AGENT_INFO = { name: "zcode-acp", title: "ZCode", version: "0.5.5" };
 
 // 认证方式声明：ACP Registry 校验 authMethods 非空，空数组会让上架 CI 直接拒绝。
 // 凭据由 zcode CLI 自己持有（login / Desktop 签发），客户端无需提供任何东西，
@@ -40,7 +41,43 @@ const MODE_IDS = new Set([...MODES.map((mode) => mode.id), "edit"]);
 
 // 会话记录（本进程签发）。客户端回传的会话 id 只做等值比对，
 // 命中的始终是本地记录对象，外部值不参与任何寻址。
+// 上限：桥接进程可能被宿主长期复用，客户端反复 new/load 会让记录无限增长
+//（每条还持有 cancel 闭包 → 子进程引用）。超出上限时淘汰最旧的**空闲**记录，
+// 正在跑的轮次不淘汰，否则会丢 zcodeSessionId 造成上下文断裂。
+const MAX_RECORDS = 64;
 const records = [];
+
+/** 记录入表：超上限时从最早开始淘汰空闲项；满了且全忙则放弃淘汰（宁可不加）。 */
+function trackRecord(record) {
+  if (records.length >= MAX_RECORDS) {
+    const idle = records.findIndex((candidate) => !candidate.busy);
+    if (idle < 0) return false;
+    records.splice(idle, 1);
+  }
+  records.push(record);
+  return true;
+}
+
+/**
+ * 新建一条会话记录。
+ *
+ * 规则：字段必须在此集中初始化——session/new、resume、load 三条路径都要完整
+ * 记录，漏一个字段（如 busy）会让对应路径的串行保护失效。
+ */
+function createRecord(id, cwd) {
+  return {
+    id,
+    cwd,
+    zcodeSessionId: undefined,
+    model: null,
+    reasoningLevel: null,
+    mode: null,
+    // 当前轮次的取消句柄（由 runTurn 的 onStart 赋值），仅用于 session/cancel。
+    stop: null,
+    // 串行占位：进入 session/prompt 时同步置位，阻止同会话并发轮次。
+    busy: false,
+  };
+}
 
 /** 按本地签发值与回传值等值比对，返回对应的本地记录。 */
 function findRecord(incomingId) {
@@ -52,12 +89,17 @@ function findRecord(incomingId) {
 }
 
 /**
- * ACP 的 cwd 必须是绝对路径；不存在时回退到用户主目录，
- * 否则 zcode --cwd 会直接报错退出。
+ * ACP 的 cwd 必须是绝对路径且真实存在，否则 zcode --cwd 会直接报错退出。
+ * 规则：任一校验失败都回退到用户主目录——cwd 是客户端给的，路径不可读
+ * （权限不足等）时 statSync 会抛异常，不能让它冒泡成协议错误。
  */
 function normalizeCwd(cwd) {
-  if (typeof cwd === "string" && path.isAbsolute(cwd) && existsSync(cwd) && statSync(cwd).isDirectory()) {
-    return cwd;
+  if (typeof cwd === "string" && path.isAbsolute(cwd)) {
+    try {
+      if (existsSync(cwd) && statSync(cwd).isDirectory()) return cwd;
+    } catch {
+      // 权限不足或路径消失：落到下面的主目录回退。
+    }
   }
   return process.env.USERPROFILE ?? process.env.HOME ?? process.cwd();
 }
@@ -228,16 +270,8 @@ export function startAgent() {
     }))
     .onRequest("authenticate", () => ({}))
     .onRequest("session/new", (ctx) => {
-      const record = {
-        id: randomUUID(),
-        cwd: normalizeCwd(ctx.params.cwd),
-        zcodeSessionId: undefined,
-        model: null,
-        reasoningLevel: null,
-        mode: null,
-        stop: null,
-      };
-      records.push(record);
+      const record = createRecord(randomUUID(), normalizeCwd(ctx.params.cwd));
+      trackRecord(record);
       // 命令菜单在响应之后异步推：读命令要起子进程（约百毫秒级），
       // 同步等待会拖慢每个新会话；菜单晚到不影响会话可用。
       void emitSlashCommands(record.id);
@@ -254,16 +288,9 @@ export function startAgent() {
       // 正确做法是接受该 id 并重建记录（zcode 侧上下文丢了，由客户端重发消息弥补）。
       // 已有记录只刷新 cwd，保留 zcodeSessionId / model / reasoningLevel / mode，续接与选型不丢。
       const existing = findRecord(ctx.params.sessionId);
-      const record = existing ?? {
-        id: String(ctx.params.sessionId),
-        zcodeSessionId: undefined,
-        model: null,
-        reasoningLevel: null,
-        mode: null,
-        stop: null,
-      };
+      const record = existing ?? createRecord(String(ctx.params.sessionId), normalizeCwd(ctx.params.cwd));
       record.cwd = normalizeCwd(ctx.params.cwd);
-      if (!existing) records.push(record);
+      if (!existing) trackRecord(record);
       return {
         models: modelsPayload(record),
         modes: modesPayload(record),
@@ -275,16 +302,9 @@ export function startAgent() {
       // 本 agent 不持久化消息历史，无法重放历史 update；这里只重建会话记录，
       // 让后续 prompt 能用（历史为空由客户端自行处理）。
       const existing = findRecord(ctx.params.sessionId);
-      const record = existing ?? {
-        id: String(ctx.params.sessionId),
-        zcodeSessionId: undefined,
-        model: null,
-        reasoningLevel: null,
-        mode: null,
-        stop: null,
-      };
+      const record = existing ?? createRecord(String(ctx.params.sessionId), normalizeCwd(ctx.params.cwd));
       record.cwd = normalizeCwd(ctx.params.cwd);
-      if (!existing) records.push(record);
+      if (!existing) trackRecord(record);
       return {
         models: modelsPayload(record),
         modes: modesPayload(record),
@@ -363,58 +383,76 @@ export function startAgent() {
       if (!text.trim()) return { stopReason: "end_turn" };
 
       // 同一会话串行：并发 prompt 会争抢 zcodeSessionId，先拒绝后者。
-      if (record.stop) return { stopReason: "refusal" };
-
-      // 技能名改写要在拼附件说明之前：CLI 只认开头的斜杠命令，拼了后缀就失效。
-      const commandText = rewriteSkillCommand(text, await knownNames());
-
-      const attachmentDir = images.length > 0 ? mkdtempSync(path.join(tmpdir(), "zcode-acp-images-")) : null;
+      // 占位必须在这里同步完成：record.stop 由 runTurn 的 onStart 才赋值，
+      // 中间隔着下面的 await，两个并发请求都能穿过检查各自 spawn 一个 zcode。
+      if (record.busy) return { stopReason: "refusal" };
+      record.busy = true;
       try {
-        const attachments = images.map((image, index) => {
-          const extension = IMAGE_EXTENSIONS[image.mimeType];
-          if (!extension) throw new Error(`不支持的图片类型：${image.mimeType}；仅支持 PNG/JPEG/GIF/WebP`);
-          const data = Buffer.from(image.data, "base64");
-          if (data.length === 0) throw new Error("图片内容为空");
-          const file = path.join(attachmentDir, `image-${index}${extension}`);
-          writeFileSync(file, data);
-          return file;
-        });
-        const prompt = attachments.length > 0
-          ? `${commandText}\n\n请使用 Read 工具读取以下图片后再回答：\n${attachments.join("\n")}`
-          : commandText;
-        const result = await runTurn({
-          cwd: record.cwd,
-          text: prompt,
-          resume: record.zcodeSessionId,
-          mode: record.mode ?? DEFAULT_MODE,
-          // 思考级别随模型一起进 provider 配置副本（见 models.js）。
-          model: record.model
-            ? { ...record.model, reasoningLevel: record.reasoningLevel ?? undefined }
-            : record.reasoningLevel
-              ? { reasoningLevel: record.reasoningLevel }
-              : null,
-          onStart: (stop) => {
-            record.stop = stop;
-          },
-          onEvent: (event) => {
-            // 先落 sessionId，即使这一轮被中断也能续接下一轮。
-            if (event.sessionId) record.zcodeSessionId = event.sessionId;
-            for (const update of eventToUpdates(event, record.cwd)) {
-              // 不等待客户端确认：单条通知失败不应阻断整轮执行。
-              emitUpdate(record.id, update).catch(() => {});
-            }
-          },
-        });
+        // 先拆 MiCO 信封（用户原话留作正文、模板走附件），再改写 `/技能名`
+        //（只认首行斜杠命令）；两者都在拼附件说明之前——CLI 只认开头的斜杠命令。
+        const split = splitTaskEnvelope(text);
+        const commandText = rewriteSkillCommand(split.prompt, await knownNames());
 
-        if (result.cancelled) return { stopReason: "cancelled" };
-        if (result.error) {
-          await emitText(record.id, result.error);
-          return { stopReason: "refusal" };
+        const attachmentDir = images.length > 0 ? mkdtempSync(path.join(tmpdir(), "zcode-acp-images-")) : null;
+        try {
+          // 本轮是否已向客户端发过正文：内置斜杠命令（/compact、/goal）不产生
+          // model.streaming 事件，回复只在 runTurn 返回的 content 里，需要在这里补发。
+          let sawText = false;
+          const attachments = images.map((image, index) => {
+            const extension = IMAGE_EXTENSIONS[image.mimeType];
+            if (!extension) throw new Error(`不支持的图片类型：${image.mimeType}；仅支持 PNG/JPEG/GIF/WebP`);
+            const data = Buffer.from(image.data, "base64");
+            if (data.length === 0) throw new Error("图片内容为空");
+            const file = path.join(attachmentDir, `image-${index}${extension}`);
+            writeFileSync(file, data);
+            return file;
+          });
+          const prompt = attachments.length > 0
+            ? `${commandText}\n\n请使用 Read 工具读取以下图片后再回答：\n${attachments.join("\n")}`
+            : commandText;
+          const result = await runTurn({
+            cwd: record.cwd,
+            text: prompt,
+            // MiCO 模板走附件：进模型上下文，但不进会话标题与首条消息。
+            envelope: split.envelope,
+            resume: record.zcodeSessionId,
+            mode: record.mode ?? DEFAULT_MODE,
+            // 思考级别随模型一起进 provider 配置副本（见 models.js）。
+            model: record.model
+              ? { ...record.model, reasoningLevel: record.reasoningLevel ?? undefined }
+              : record.reasoningLevel
+                ? { reasoningLevel: record.reasoningLevel }
+                : null,
+            onStart: (stop) => {
+              record.stop = stop;
+            },
+            onEvent: (event) => {
+              // 先落 sessionId，即使这一轮被中断也能续接下一轮。
+              if (event.sessionId) record.zcodeSessionId = event.sessionId;
+              // model.streaming 是正文的唯一来源；命令类轮次没有它。
+              if (event.type === "model.streaming" && event.payload?.kind === "text_delta") sawText = true;
+              for (const update of eventToUpdates(event, record.cwd)) {
+                // 不等待客户端确认：单条通知失败不应阻断整轮执行。
+                emitUpdate(record.id, update).catch(() => {});
+              }
+            },
+          });
+
+          if (result.cancelled) return { stopReason: "cancelled" };
+          if (result.error) {
+            await emitText(record.id, result.error);
+            return { stopReason: "refusal" };
+          }
+          // 命令类轮次的回复没有流式增量，需要在这里补发，否则客户端什么都看不到。
+          if (!sawText && result.content) await emitText(record.id, result.content);
+          return { stopReason: "end_turn" };
+        } finally {
+          record.stop = null;
+          if (attachmentDir) rmSync(attachmentDir, { recursive: true, force: true });
         }
-        return { stopReason: "end_turn" };
       } finally {
-        record.stop = null;
-        if (attachmentDir) rmSync(attachmentDir, { recursive: true, force: true });
+        // 串行占位必须在所有返回路径上释放，否则该会话此后一律 refusal。
+        record.busy = false;
       }
     })
     .onNotification("session/cancel", (ctx) => {
