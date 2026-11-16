@@ -4,7 +4,14 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { findModel, listModels, writeSelectionConfig } from "../src/models.js";
-import { createSemanticStream, effortLevelsForModel, reasoningLevelForEffort, usageOf } from "../src/claude.js";
+import {
+  assistantUsageOf,
+  createSemanticStream,
+  effortLevelsForModel,
+  modelUsageOf,
+  reasoningLevelForEffort,
+  usageOf,
+} from "../src/claude.js";
 import { readRuntimeEnvFile } from "../src/runtime-env.js";
 import { applyZcodeRuntimeEnv } from "../src/zcode.js";
 
@@ -346,6 +353,42 @@ test("usageOfAccumulatesPerRequest", () => {
     input_tokens: 9507,
     output_tokens: 567,
     cache_read_input_tokens: 46848,
+  });
+});
+
+test("emitSemanticAttachesUsageToAssistantMessages", () => {
+  // 宿主按消息 id 逐条聚合 token（MiCO 侧为 assistantUsageByID），usage 必须挂在
+  // assistant 消息上；只发 result 总量会让逐条累加拿不到任何一条，统计恒为 0。
+  const usage = { input_tokens: 42, output_tokens: 6, cache_read_input_tokens: 1024 };
+  const assistant = { type: "assistant", message: { role: "assistant", content: [] } };
+  assert.deepEqual(assistantUsageOf(assistant, usage), usage);
+  // user 消息（工具结果）不挂 usage：一条轮次里只有模型输出计费。
+  const toolResult = {
+    type: "user",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "" }] },
+  };
+  assert.equal(assistantUsageOf(toolResult, usage), null);
+  // 无 usage 时不写该字段，避免给宿主塞空对象。
+  assert.equal(assistantUsageOf(assistant, null), null);
+});
+
+test("modelUsageOfConvertsToCamelFields", () => {
+  // modelUsage 是「模型名 → 用量」的 map，条目字段为驼峰，与 usage 的 snake_case 不同源。
+  assert.deepEqual(
+    modelUsageOf({
+      input_tokens: 42,
+      output_tokens: 6,
+      cache_read_input_tokens: 1024,
+      cache_creation_input_tokens: 0,
+    }),
+    { inputTokens: 42, outputTokens: 6, cacheReadInputTokens: 1024, cacheCreationInputTokens: 0 },
+  );
+  // 缺字段补 0，宿主侧按整数累加，不能出现 undefined。
+  assert.deepEqual(modelUsageOf({ input_tokens: 5 }), {
+    inputTokens: 5,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
   });
 });
 

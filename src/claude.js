@@ -137,6 +137,22 @@ export function usageOf(event) {
   return Object.keys(fields).length > 0 ? fields : null;
 }
 
+/**
+ * 把 usage（snake_case）转成 modelUsage 的单模型条目（camelCase）。
+ *
+ * 规则：
+ * - Claude Code 的 modelUsage 是「模型名 → 该模型用量」的 map，条目字段为驼峰；
+ * - 与 usage 同源，只是命名口径不同，缺字段按 0 处理。
+ */
+export function modelUsageOf(usage) {
+  return {
+    inputTokens: usage.input_tokens ?? 0,
+    outputTokens: usage.output_tokens ?? 0,
+    cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
+    cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
+  };
+}
+
 // 语义事件保活间隔：宿主按「距上次语义事件」判活（实测预算 10 分钟），
 // 纯文本长任务不产生工具事件，需要定期把已累积文本作为一段发出。
 const SEMANTIC_KEEPALIVE_MS = 60_000;
@@ -237,13 +253,32 @@ export function createSemanticStream() {
   };
 }
 
+/**
+ * 取一条语义消息应挂的 usage：只有 assistant 消息计费，其余返回 null。
+ *
+ * 规则：
+ * - Claude Code 把每轮 token 用量挂在 assistant 消息的 message.usage 上，
+ *   宿主按消息 id 逐条聚合（MiCO 侧为 assistantUsageByID）；
+ * - 工具结果（user 消息）不挂 usage，一条轮次里只有模型输出计费；
+ * - 无 usage 时返回 null，调用方据此不写该字段。
+ */
+export function assistantUsageOf(semantic, usage) {
+  if (!usage) return null;
+  return semantic?.type === "assistant" ? usage : null;
+}
+
 /** 发一条语义消息：补齐 id / session_id / uuid，宿主只认完整形态。 */
-function emitSemantic(sessionId, modelName, semantic) {
+function emitSemantic(sessionId, modelName, semantic, usage) {
   if (!semantic) return;
   const message =
     semantic.type === "assistant"
       ? { id: randomUUID(), type: "message", model: modelName, ...semantic.message }
       : semantic.message;
+  // Claude Code 把每轮 token 用量挂在 assistant 消息的 message.usage 上，宿主按
+  // 消息 id 逐条聚合（MiCO 侧即 assistantUsageByID）；只在末尾 result 里发总量，
+  // 宿主逐条累加时拿不到任何一条，统计恒为 0。
+  const attached = assistantUsageOf(semantic, usage);
+  if (attached) message.usage = attached;
   emit({
     type: semantic.type,
     message,
@@ -436,7 +471,7 @@ export async function startClaude(args) {
     let usage;
     // 保活：长任务在两次工具调用之间可能长时间没有语义事件，宿主会判死。
     const keepalive = setInterval(() => {
-      emitSemantic(sessionId, options.model, semantics.flush());
+      emitSemantic(sessionId, options.model, semantics.flush(), usage);
     }, SEMANTIC_KEEPALIVE_MS);
     keepalive.unref();
     const result = await runTurn({
@@ -455,21 +490,26 @@ export async function startClaude(args) {
         }
         const turnUsage = usageOf(event);
         if (turnUsage) usage = addUsage(usage, turnUsage);
-        emitSemantic(sessionId, options.model, semantics.consume(event));
+        emitSemantic(sessionId, options.model, semantics.consume(event), usage);
       },
     }).finally(() => clearInterval(keepalive));
     emitInit();
 
     const content = result.error ?? result.content ?? "";
     // 收尾：先吐最后一段未发出的文本，避免结尾回复丢失。
-    emitSemantic(sessionId, options.model, semantics.flush());
+    emitSemantic(sessionId, options.model, semantics.flush(), usage);
     // 正常路径下文本已随语义消息分段发出，整段再发一次会让宿主侧回复重复；
     // 只有全程没有任何增量事件（老版本 CLI 或纯错误）时才回退成整段发出。
     if (content && (result.error || !semantics.produced())) {
-      emitSemantic(sessionId, options.model, {
-        type: "assistant",
-        message: { role: "assistant", content: [{ type: "text", text: content }] },
-      });
+      emitSemantic(
+        sessionId,
+        options.model,
+        {
+          type: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: content }] },
+        },
+        usage,
+      );
     }
     emit({
       type: "result",
@@ -479,8 +519,9 @@ export async function startClaude(args) {
       session_id: sessionId,
       duration_ms: Date.now() - startedAt,
       num_turns: 1,
-      // 宿主按 Claude Code 的 result.usage 兜底累加 token 用量；缺失时不写该字段。
-      ...(usage ? { usage } : {}),
+      // Claude Code 的 result 同时带 usage 与 modelUsage（按模型分组，字段为驼峰）。
+      // 宿主按模型落库走 modelUsage，只发 usage 会让 per-model 统计落空。
+      ...(usage ? { usage, modelUsage: { [options.model ?? "zcode"]: modelUsageOf(usage) } } : {}),
     });
     if (result.error) process.exitCode = 1;
   } catch (error) {
