@@ -85,8 +85,9 @@ zcode-acp 在 `session/new` / `session/load` / `session/resume` 里报告真实�
 与 `session/set_config_option` 的实现是：生成一份把选中项重排到位的**一次性
 provider 配置副本**（临时目录，随机文件名）喂给子进程——认证不受影响。
 
-已知限制：选择存在 zcode-acp 进程内存里，zcode-acp 重启后回到默认值，客户端重选一次即可；
-同一会话内多轮续接（`--resume`）保持选中项。
+会话续接状态（zcodeSessionId 映射与模型 / 思考级别 / 模式选择）落盘在 `~/.zcode-acp-sessions.json`，
+zcode-acp 重启后由 `session/resume` / `session/load` 自动恢复，续接不断、选择也不丢；
+同一会话内多轮续接（`--resume`）同样保持选中项。
 
 ### 在 Mutica 上启用思考级别
 

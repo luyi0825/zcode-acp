@@ -12,10 +12,13 @@ import { attachClient, emitAvailableCommands, emitText, emitUpdate } from "./emi
 import { discoverCapabilities, listSlashCommands } from "./commands.js";
 import { rewriteSkillCommand } from "./slash-text.js";
 import { splitTaskEnvelope } from "./prompt-envelope.js";
+import { persistSession, restoreSession } from "./session-store.js";
+import { forkZcodeSession } from "./fork.js";
+import { logEvent } from "./logger.js";
 import { loadDefaultRuntimeEnv } from "./runtime-env.js";
 import { encodeModelId, findModel, isKnownReasoningLevel, listModels, REASONING_LEVELS } from "./models.js";
 
-export const AGENT_INFO = { name: "zcode-acp", title: "ZCode", version: "0.5.5" };
+export const AGENT_INFO = { name: "zcode-acp", title: "ZCode", version: "0.5.6" };
 
 // 认证方式声明：ACP Registry 校验 authMethods 非空，空数组会让上架 CI 直接拒绝。
 // 凭据由 zcode CLI 自己持有（login / Desktop 签发），客户端无需提供任何东西，
@@ -47,11 +50,20 @@ const MODE_IDS = new Set([...MODES.map((mode) => mode.id), "edit"]);
 const MAX_RECORDS = 64;
 const records = [];
 
+// 退出宽限（毫秒）：killTree 的 Windows 分支靠异步 spawn taskkill 杀进程树，
+// 收到退出事件就立即 exit 可能抢在信号落地前——留一个短窗口让清理先生效。
+const SHUTDOWN_GRACE_MS = 300;
+
 /** 记录入表：超上限时从最早开始淘汰空闲项；满了且全忙则放弃淘汰（宁可不加）。 */
 function trackRecord(record) {
   if (records.length >= MAX_RECORDS) {
     const idle = records.findIndex((candidate) => !candidate.busy);
-    if (idle < 0) return false;
+    if (idle < 0) {
+      // 满载且全忙：本次记录不入表，客户端拿着返回的 sessionId 调 prompt 会报
+      // sessionNotFound——这种罕见失败没有日志时无从排查。
+      logEvent("records.full", { total: records.length });
+      return false;
+    }
     records.splice(idle, 1);
   }
   records.push(record);
@@ -155,7 +167,9 @@ function modelsPayload(record) {
 }
 
 // ACP 新版用 configOptions 声明可调选项；旧版字段（models/modes）与之并存。
-// category=thought_level 是客户端识别思考档位的语义标记，不能只靠自定义 id。
+// category 是客户端识别选择器的语义标记，不能只靠自定义 id：
+// 新版 schema 的 session/new 已无 models 字段，Zed 只认 category=model 的选项。
+const MODEL_OPTION_ID = "model";
 const REASONING_OPTION_ID = "thought_level";
 const REASONING_OPTION_IDS = new Set([REASONING_OPTION_ID, "reasoning"]);
 const REASONING_NAMES = {
@@ -192,16 +206,30 @@ function reasoningLevelsForRecord(record) {
 }
 
 /**
- * 思考级别选项（configOptions 形态）。档位与默认值都来自当前模型的有效规则；
- * 模型明确不支持思考选项时不返回该选择器。
+ * 会话配置选项（configOptions 形态）：模型选择器 + 思考级别选择器。
+ * 规则：
+ * - 模型选项只在本机有真实模型列表时声明；回退单模型不可切换，不摆死选择器；
+ * - 思考档位与默认值来自当前模型的有效规则，模型明确不支持时不返回该选择器。
  */
 function configOptionsPayload(record) {
+  const options = [];
+  const models = listModels();
+  if (models) {
+    options.push({
+      id: MODEL_OPTION_ID,
+      name: "模型",
+      description: "本机可用的 ZCode 模型",
+      category: "model",
+      type: "select",
+      currentValue: record?.model ? encodeModelId(record.model) : models.currentModelId,
+      options: models.availableModels.map(({ modelId, name }) => ({ value: modelId, name })),
+    });
+  }
   const levels = reasoningLevelsForRecord(record);
-  if (levels.length === 0) return [];
-  const selected = record?.reasoningLevel;
-  const currentValue = selected && levels.includes(selected) ? selected : levels.at(-1);
-  return [
-    {
+  if (levels.length > 0) {
+    const selected = record?.reasoningLevel;
+    const currentValue = selected && levels.includes(selected) ? selected : levels.at(-1);
+    options.push({
       id: REASONING_OPTION_ID,
       name: "思考级别",
       description: "当前 ZCode 模型支持的推理深度（reasoningLevel）",
@@ -209,8 +237,9 @@ function configOptionsPayload(record) {
       type: "select",
       currentValue,
       options: levels.map((level) => ({ value: level, name: REASONING_NAMES[level] ?? level })),
-    },
-  ];
+    });
+  }
+  return options;
 }
 
 /**
@@ -254,20 +283,29 @@ export function startAgent() {
   const app = acp.agent({ name: AGENT_INFO.name });
 
   app
-    .onRequest("initialize", () => ({
-      protocolVersion: acp.PROTOCOL_VERSION,
-      agentCapabilities: {
-        // 部分客户端的 IM 路径会先 session/load 再 prompt；声明 false 会让它在协商阶段
-        // 判定 runtime 不可用（日志 supported:false → provider_process_exited）。
-        loadSession: true,
-        // 客户端续接任务时会调用 session/resume；不声明会被判为方法不存在。
-        sessionCapabilities: { resume: {} },
-        promptCapabilities: { image: true, audio: false, embeddedContext: false },
-        mcpCapabilities: { http: false, sse: false },
-      },
-      authMethods: AUTH_METHODS,
-      agentInfo: AGENT_INFO,
-    }))
+    .onRequest("initialize", (ctx) => {
+      // 客户端连接的唯一现场：宿主侧行为异常（如不显示 agent 版本）时靠它对版本与来源。
+      logEvent("initialize", {
+        client: ctx.params?.clientInfo?.name,
+        clientVersion: ctx.params?.clientInfo?.version,
+        agentVersion: AGENT_INFO.version,
+      });
+      return {
+        protocolVersion: acp.PROTOCOL_VERSION,
+        agentCapabilities: {
+          // 部分客户端的 IM 路径会先 session/load 再 prompt；声明 false 会让它在协商阶段
+          // 判定 runtime 不可用（日志 supported:false → provider_process_exited）。
+          loadSession: true,
+          // 客户端续接任务时会调用 session/resume；不声明会被判为方法不存在。
+          // fork 是 unstable 能力：OpenIDEA 按该声明启用 fork 入口（实现见 session/fork）。
+          sessionCapabilities: { resume: {}, fork: {} },
+          promptCapabilities: { image: true, audio: false, embeddedContext: false },
+          mcpCapabilities: { http: false, sse: false },
+        },
+        authMethods: AUTH_METHODS,
+        agentInfo: AGENT_INFO,
+      };
+    })
     .onRequest("authenticate", () => ({}))
     .onRequest("session/new", (ctx) => {
       const record = createRecord(randomUUID(), normalizeCwd(ctx.params.cwd));
@@ -285,12 +323,16 @@ export function startAgent() {
     .onRequest("session/resume", (ctx) => {
       // 客户端的 IM 多轮对话会带着旧 sessionId 调 resume。bridge 进程重启后内存记录
       // 必然丢失，报 Resource not found 会让对话从第二轮起全部失败；
-      // 正确做法是接受该 id 并重建记录（zcode 侧上下文丢了，由客户端重发消息弥补）。
+      // 正确做法是接受该 id 并重建记录，再从落盘恢复 zcodeSessionId 等续接状态
+      //（见 session-store.js），续接不断、也不再新建重复会话。
       // 已有记录只刷新 cwd，保留 zcodeSessionId / model / reasoningLevel / mode，续接与选型不丢。
       const existing = findRecord(ctx.params.sessionId);
       const record = existing ?? createRecord(String(ctx.params.sessionId), normalizeCwd(ctx.params.cwd));
       record.cwd = normalizeCwd(ctx.params.cwd);
-      if (!existing) trackRecord(record);
+      if (!existing) {
+        restoreSession(record);
+        trackRecord(record);
+      }
       return {
         models: modelsPayload(record),
         modes: modesPayload(record),
@@ -299,18 +341,59 @@ export function startAgent() {
     })
     .onRequest("session/load", (ctx) => {
       // 客户端的 IM 对话路径会先用 session/load 恢复会话再 prompt。
-      // 本 agent 不持久化消息历史，无法重放历史 update；这里只重建会话记录，
-      // 让后续 prompt 能用（历史为空由客户端自行处理）。
+      // 本 agent 不持久化消息历史，无法重放历史 update；这里重建会话记录并从落盘
+      // 恢复续接状态（见 session-store.js），让后续 prompt 能续接原 zcode 会话
+      //（历史为空由客户端自行处理）。
       const existing = findRecord(ctx.params.sessionId);
       const record = existing ?? createRecord(String(ctx.params.sessionId), normalizeCwd(ctx.params.cwd));
       record.cwd = normalizeCwd(ctx.params.cwd);
-      if (!existing) trackRecord(record);
+      if (!existing) {
+        restoreSession(record);
+        trackRecord(record);
+      }
       return {
         models: modelsPayload(record),
         modes: modesPayload(record),
         configOptions: configOptionsPayload(record),
       };
     })
+    // ACP unstable 的 session/fork：复制历史到独立新会话，后续 prompt 不影响原会话。
+    // fork 经 zcode app-server 完成（见 fork.js）；新会话继承模型 / 思考档位 / 模式选择。
+    // 源记录未命中时与 resume/load 同规则重建（bridge 重启后从落盘恢复续接状态）。
+    // unstable 方法不在 SDK stable 方法表里，必须显式传 params 解析器。
+    .onRequest(
+      "session/fork",
+      (params) => (typeof params === "object" && params !== null ? params : {}),
+      async (ctx) => {
+        const existing = findRecord(ctx.params.sessionId);
+        const source = existing ?? createRecord(String(ctx.params.sessionId), normalizeCwd(ctx.params.cwd));
+        if (!existing) {
+          restoreSession(source);
+          trackRecord(source);
+        }
+        // zcode 侧也禁止运行中 fork；这里先挡一层，避免白起一个 app-server。
+        if (source.busy) throw acp.RequestError.internalError(null, "会话正在执行中，无法 fork");
+        const cwd = normalizeCwd(ctx.params.cwd);
+        const record = createRecord(randomUUID(), cwd);
+        record.model = source.model;
+        record.reasoningLevel = source.reasoningLevel;
+        record.mode = source.mode;
+        // 无 zcodeSessionId 即还没跑过对话：无历史可复制，fork 退化为新建。
+        if (source.zcodeSessionId) {
+          const forkedId = await forkZcodeSession({ cwd, sessionId: source.zcodeSessionId });
+          if (forkedId) record.zcodeSessionId = forkedId;
+        }
+        trackRecord(record);
+        persistSession(record);
+        void emitSlashCommands(record.id);
+        return {
+          sessionId: record.id,
+          models: modelsPayload(record),
+          modes: modesPayload(record),
+          configOptions: configOptionsPayload(record),
+        };
+      },
+    )
     // 部分宿主的私有扩展（ACP 标准里没有）：会话建立后会调它设置模型；
     // 其它客户端在用户切换模型时也会调它。不实现会 -32601 直接失败。
     // 只记录本机模型列表里的选择（provider::model 编码，见 models.js），
@@ -327,6 +410,7 @@ export function startAgent() {
           if (!isKnownReasoningLevel(record.reasoningLevel, selection.reasoningLevels)) {
             record.reasoningLevel = null;
           }
+          persistSession(record);
           await emitUpdate(record.id, {
             sessionUpdate: "config_option_update",
             configOptions: configOptionsPayload(record),
@@ -345,6 +429,7 @@ export function startAgent() {
         const record = findRecord(ctx.params.sessionId);
         if (record && MODE_IDS.has(ctx.params.modeId)) {
           record.mode = ctx.params.modeId;
+          persistSession(record);
           await emitUpdate(record.id, {
             sessionUpdate: "current_mode_update",
             currentModeId: record.mode,
@@ -354,19 +439,37 @@ export function startAgent() {
       },
     )
     // ACP 标准的配置选项设置：configId 为本 agent 声明的选项 id。
-    // 只接受思考级别选项且值在认可集合内；其余静默忽略，保持当前值。
+    // 接受模型与思考级别选项，非法值静默忽略保持当前值。
     // 设置成功后广播 config_option_update（全量选项），让客户端 UI 即时刷新。
     .onRequest(
       "session/set_config_option",
       (params) => (typeof params === "object" && params !== null ? params : {}),
       async (ctx) => {
         const record = findRecord(ctx.params.sessionId);
+        if (!record) return {};
+        if (ctx.params.configId === MODEL_OPTION_ID) {
+          // 与 set_model 同规则：只认本机模型列表内的选择，未知值保持默认。
+          const selection = findModel(ctx.params.value);
+          if (selection) {
+            record.model = selection;
+            // 旧档位可能不受新模型支持，清空后由 configOptionsPayload 回显新模型默认档位。
+            if (!isKnownReasoningLevel(record.reasoningLevel, selection.reasoningLevels)) {
+              record.reasoningLevel = null;
+            }
+            persistSession(record);
+            await emitUpdate(record.id, {
+              sessionUpdate: "config_option_update",
+              configOptions: configOptionsPayload(record),
+            }).catch(() => {});
+          }
+          return {};
+        }
         if (
-          record &&
           REASONING_OPTION_IDS.has(ctx.params.configId) &&
           isKnownReasoningLevel(ctx.params.value, reasoningLevelsForRecord(record))
         ) {
           record.reasoningLevel = ctx.params.value;
+          persistSession(record);
           await emitUpdate(record.id, {
             sessionUpdate: "config_option_update",
             configOptions: configOptionsPayload(record),
@@ -427,8 +530,12 @@ export function startAgent() {
               record.stop = stop;
             },
             onEvent: (event) => {
-              // 先落 sessionId，即使这一轮被中断也能续接下一轮。
-              if (event.sessionId) record.zcodeSessionId = event.sessionId;
+              // 先落 sessionId，即使这一轮被中断也能续接下一轮；变化时落盘，
+              // bridge 重启后 resume/load 据此恢复续接（见 session-store.js）。
+              if (event.sessionId && event.sessionId !== record.zcodeSessionId) {
+                record.zcodeSessionId = event.sessionId;
+                persistSession(record);
+              }
               // model.streaming 是正文的唯一来源；命令类轮次没有它。
               if (event.type === "model.streaming" && event.payload?.kind === "text_delta") sawText = true;
               for (const update of eventToUpdates(event, record.cwd)) {
@@ -450,6 +557,13 @@ export function startAgent() {
           record.stop = null;
           if (attachmentDir) rmSync(attachmentDir, { recursive: true, force: true });
         }
+      } catch (error) {
+        // runTurn 的启动失败（CLI 找不到 / provider 配置副本写盘失败）与图片校验抛错
+        // 在此收口：不兜底会冒泡成协议级 Internal error，用户看不到任何定位指引。
+        const message = error instanceof Error ? error.message : String(error);
+        logEvent("prompt.error", { sessionId: record.id, message: message.slice(0, 500) });
+        await emitText(record.id, message).catch(() => {});
+        return { stopReason: "refusal" };
       } finally {
         // 串行占位必须在所有返回路径上释放，否则该会话此后一律 refusal。
         record.busy = false;
@@ -463,6 +577,18 @@ export function startAgent() {
   // 连接建立后注册客户端句柄，供通知发送使用。
   attachClient(app.connect(stream).client);
 
-  // ACP 客户端断开 stdin 时进程应退出，避免留下僵尸子进程。
-  process.stdin.on("end", () => process.exit(0));
+  // 宿主断开 / 终止信号时先终止在跑的 zcode 子进程树再退出：POSIX 下 zcode
+  // 自成进程组（detached），宿主杀 bridge 进程组不会波及它，不清理会留下孤儿
+  // 继续消耗 token / 改文件。空闲记录的 stop 为 null，重复触发安全。
+  const shutdown = () => {
+    const running = records.filter((record) => record.busy);
+    if (running.length > 0) {
+      logEvent("shutdown", { killed: running.length });
+      for (const record of running) record.stop?.();
+    }
+    setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS);
+  };
+  process.stdin.on("end", shutdown);
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }

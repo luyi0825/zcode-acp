@@ -1,7 +1,7 @@
 # zcode-acp 使用指南
 
 面向使用者的接入手册：安装、接入 OpenIDEA、验证与排障。
-对应 `@luyi0825/zcode-acp` 0.5.5；最后更新：2026-11-16。
+对应 `@luyi0825/zcode-acp` 0.5.6；最后更新：2026-11-17。
 
 zcode-acp 把 [ZCode](https://zcode.z.ai) CLI 包装成 **ACP v1 agent**，让 ACP 客户端把 ZCode 当作自己的编码 agent：
 
@@ -26,8 +26,8 @@ zcode-acp 只做协议翻译；工具、技能、MCP、多轮上下文等 agent 
 再用 npm 从本地安装：
 
 ```bash
-npm install -g ./luyi0825-zcode-acp-0.5.5.tgz
-zcode-acp --version    # 输出版本号（当前 0.5.5）即安装成功
+npm install -g ./luyi0825-zcode-acp-0.5.6.tgz
+zcode-acp --version    # 输出版本号（当前 0.5.6）即安装成功
 ```
 
 ## 3. 登录与认证
@@ -103,7 +103,7 @@ command -v zcode-acp   # macOS / Linux
 
 > **安全提示（必读）**：默认权限模式是 **yolo**——headless 运行没有确认入口，agent 会**无确认地读写文件、执行命令**。只把 zcode-acp 接入你信任的客户端与项目；需要受控执行时在客户端切换 **plan**（只读）或 **guarded**（守卫模式）。
 
-已知行为：模型 / 思考级别 / 模式的选择存在 zcode-acp 进程内存里，zcode-acp 重启后回到默认值，客户端重选一次即可；同一会话内多轮续接保持选中项。
+已知行为：模型 / 思考级别 / 模式的选择与会话续接映射落盘在 `~/.zcode-acp-sessions.json`，zcode-acp 重启后由 `session/resume` / `session/load` 自动恢复，续接与选择都不丢；同一会话内多轮续接保持选中项。
 
 ### 6.1 验证模型与思考级别生效
 
@@ -133,7 +133,7 @@ command -v zcode-acp   # macOS / Linux
 | 模型列表为空 / 选不了模型 | `zcode-acp doctor` 看第 4 项；通常是未登录（provider 配置未生成） |
 | Windows 下客户端拉不起 zcode-acp | `where zcode-acp` 确认命中预期形态（npm 全局 bin 或 `~/.local/bin/zcode-acp.exe`），必要时重开客户端；部分宿主只接受真可执行文件，见 README「开发」一节的单文件 exe |
 | OpenIDEA 列表里没有 ZCode | 核对 toml 路径与内容 → 重新打开「新建 Agent 任务」页 / 窗口重新聚焦 → 完全重启 OpenIDEA |
-| zcode-acp 重启后上下文 / 选择丢失 | 正常限制（会话状态只存内存）：客户端重发上下文、重选模型即可 |
+| zcode-acp 重启后上下文 / 选择丢失 | 续接状态已落盘 `~/.zcode-acp-sessions.json` 并自动恢复；若仍丢失，检查该文件是否被删 / 损坏（损坏会降级回内存-only），必要时客户端重发上下文、重选模型 |
 | `doctor --probe` 失败 | 看报错尾部提示；含 401 相关字样先重新登录再重试 |
 
 ## 9. 其它客户端
@@ -144,4 +144,4 @@ Zed 的 `settings.json`：
 { "agent_servers": { "zcode": { "command": "zcode-acp", "args": [] } } }
 ```
 
-其它 ACP 客户端以 stdio NDJSON 拉起 `zcode-acp`（无参数即 ACP 服务），按 ACP v1 协议交互。协议与实现原理见 [acp-sharing.md](acp-sharing.md)。
+其它 ACP 客户端以 stdio NDJSON 拉起 `zcode-acp`（无参数即 ACP 服务），按 ACP v1 协议交互。协议与实现原理见 [acp-sharing.md](../mydoc/acp-sharing.md)。

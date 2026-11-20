@@ -124,6 +124,11 @@ try {
   });
   check("initialize 返回 protocolVersion", init.protocolVersion === 1, JSON.stringify(init));
   check("initialize 声明 agentInfo.name", init.agentInfo?.name === "zcode-acp");
+  check(
+    "initialize 声明 fork 能力",
+    Boolean(init.agentCapabilities?.sessionCapabilities?.fork),
+    JSON.stringify(init.agentCapabilities),
+  );
 
   // Mutica qoder 适配器会在启动命令前加 --yolo，必须先能完成 ACP 握手。
   const qoderClient = startClient(["--yolo"]);
@@ -236,6 +241,15 @@ try {
       firstModel.modelId.includes("::") && models.currentModelId === firstModel.modelId,
       JSON.stringify(firstModel),
     );
+    // 新版 ACP：Zed 不读 models 字段，模型选择器来自 configOptions(category=model)
+    const modelOption = (modelSession.configOptions ?? []).find((o) => o.id === "model");
+    check(
+      "session/new configOptions 声明模型选择器",
+      modelOption?.category === "model" &&
+        modelOption.currentValue === models.currentModelId &&
+        modelOption.options.length === models.availableModels.length,
+      JSON.stringify(modelOption).slice(0, 200),
+    );
     // 取第二个模型，覆盖跨 provider 场景（默认第一个是 providerOrder[0]）
     const target = models.availableModels[1] ?? firstModel;
     const setKnown = await client.request("session/set_model", {
@@ -250,8 +264,43 @@ try {
     });
     check(
       "session/load 回显选中模型",
-      reloaded.models?.currentModelId === target.modelId,
+      reloaded.models?.currentModelId === target.modelId &&
+        (reloaded.configOptions ?? []).find((o) => o.id === "model")?.currentValue === target.modelId,
       JSON.stringify(reloaded.models?.currentModelId),
+    );
+    // 新协议切换路径：set_config_option(configId=model) → 广播 → 未知值不报错
+    const beforeModelOptionUpdate = client.updates.length;
+    const setModelOption = await client.request("session/set_config_option", {
+      sessionId: modelSession.sessionId,
+      configId: "model",
+      value: firstModel.modelId,
+    });
+    check(
+      "set_config_option 模型选择不报错",
+      !setModelOption.error,
+      JSON.stringify(setModelOption).slice(0, 120),
+    );
+    check(
+      "模型选择后广播 config_option_update",
+      client.updates
+        .slice(beforeModelOptionUpdate)
+        .some(
+          (u) =>
+            u.sessionUpdate === "config_option_update" &&
+            (u.configOptions ?? []).some(
+              (o) => o.id === "model" && o.currentValue === firstModel.modelId,
+            ),
+        ),
+    );
+    const badModelOption = await client.request("session/set_config_option", {
+      sessionId: modelSession.sessionId,
+      configId: "model",
+      value: "kimi-k2",
+    });
+    check(
+      "set_config_option 未知模型不报错",
+      !badModelOption.error,
+      JSON.stringify(badModelOption).slice(0, 120),
     );
     // 选中模型下跑一轮，验证 provider 配置副本不破坏 zcode 启动
     const markBefore = client.updates.length;
@@ -267,6 +316,65 @@ try {
     check("选中模型下 stopReason=end_turn", r4.stopReason === "end_turn", JSON.stringify(r4));
     check("选中模型下有回复", modelText.length > 0, JSON.stringify(modelText));
   }
+
+  // 9b. session/fork：fork 出独立新会话 → 空会话退化新建 → 续接 → 原会话不被污染
+  const forkSource = await client.request("session/new", { cwd, mcpServers: [] });
+  await client.request("session/prompt", {
+    sessionId: forkSource.sessionId,
+    prompt: [{ type: "text", text: "Reply with only: PONG" }],
+  });
+  const forked = await client.request("session/fork", {
+    sessionId: forkSource.sessionId,
+    cwd,
+    mcpServers: [],
+  });
+  check(
+    "session/fork 返回新 sessionId",
+    !forked.error && typeof forked.sessionId === "string" &&
+      forked.sessionId !== forkSource.sessionId && Array.isArray(forked.configOptions),
+    JSON.stringify(forked).slice(0, 200),
+  );
+  // 空会话（还没跑过对话）fork 退化为新建，不报错
+  const emptySource = await client.request("session/new", { cwd, mcpServers: [] });
+  const emptyFork = await client.request("session/fork", {
+    sessionId: emptySource.sessionId,
+    cwd,
+    mcpServers: [],
+  });
+  check(
+    "空会话 fork 不报错",
+    !emptyFork.error && typeof emptyFork.sessionId === "string",
+    JSON.stringify(emptyFork).slice(0, 200),
+  );
+  // fork 会话续接一轮（走 --resume=<forkedSessionId>）
+  const forkMark = client.updates.length;
+  const rf = await client.request("session/prompt", {
+    sessionId: forked.sessionId,
+    prompt: [{ type: "text", text: "Reply with only: FORK-PONG" }],
+  });
+  const forkText = client.updates
+    .slice(forkMark)
+    .filter((u) => u.sessionUpdate === "agent_message_chunk")
+    .map((u) => u.content.text)
+    .join("");
+  check("fork 会话 stopReason=end_turn", rf.stopReason === "end_turn", JSON.stringify(rf));
+  check("fork 会话有回复", forkText.length > 0, JSON.stringify(forkText));
+  // 独立性：原会话最近一条用户消息仍是 PONG，不能看到 fork 里的 FORK-PONG
+  const origMark = client.updates.length;
+  await client.request("session/prompt", {
+    sessionId: forkSource.sessionId,
+    prompt: [{ type: "text", text: "What exact text did I most recently send you? Reply with only that text." }],
+  });
+  const origText = client.updates
+    .slice(origMark)
+    .filter((u) => u.sessionUpdate === "agent_message_chunk")
+    .map((u) => u.content.text)
+    .join("");
+  check(
+    "原会话不被 fork 污染",
+    origText.includes("PONG") && !origText.includes("FORK"),
+    JSON.stringify(origText),
+  );
 
   // 10. 权限模式：modes 声明 → set_mode → 通知 → load 回显 → 选中模式下可跑
   const modeSession = await client.request("session/new", { cwd, mcpServers: [] });

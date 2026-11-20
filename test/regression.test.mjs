@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { findModel, listModels, writeSelectionConfig } from "../src/models.js";
@@ -16,8 +16,10 @@ import {
 import { readRuntimeEnvFile, personalProviderConfigPath, builtinProviderConfigAt } from "../src/runtime-env.js";
 import { applyZcodeRuntimeEnv, parseCommandOutput, summarizeStderr } from "../src/zcode.js";
 import { splitTaskEnvelope } from "../src/prompt-envelope.js";
+import { persistSession, restoreSession, sessionStorePath } from "../src/session-store.js";
 import { rewriteSkillCommand } from "../src/slash-text.js";
 import { resolveZcode } from "../src/cli-locate.js";
+import { logEvent } from "../src/logger.js";
 
 function makeTempDir(t) {
   const dir = mkdtempSync(path.join(tmpdir(), "zcode-acp-regression-"));
@@ -932,4 +934,114 @@ test("listModelsDerivesProviderConfigFromDataBaseDir", (t) => {
   );
   process.env.ZCODE_DATA_BASE_DIR = dataDir;
   assert.equal(listModels()?.availableModels.length, 1);
+});
+
+// 会话续接状态落盘（session-store）：bridge 重启后 resume/load 据此恢复 zcodeSessionId，
+// 不再新建重复会话。用 env 覆盖把落盘路径隔离到临时目录。
+function makeRecord(id, overrides = {}) {
+  return { id, zcodeSessionId: undefined, model: null, reasoningLevel: null, mode: null, ...overrides };
+}
+
+function isolateStore(t) {
+  const dir = makeTempDir(t);
+  isolateEnv(t, ["ZCODE_ACP_SESSION_STORE_FILE"]);
+  const file = path.join(dir, "sessions.json");
+  process.env.ZCODE_ACP_SESSION_STORE_FILE = file;
+  return file;
+}
+
+test("sessionStorePathHonorsEnvOverride", (t) => {
+  const file = isolateStore(t);
+  assert.equal(sessionStorePath(), file);
+});
+
+test("sessionStoreRoundTripsResumeState", (t) => {
+  isolateStore(t);
+  const model = { providerId: "p1", modelId: "m1", reasoningLevels: ["low", "high"] };
+  persistSession(makeRecord("acp-1", { zcodeSessionId: "sess_abc", model, reasoningLevel: "high", mode: "build" }));
+  // 模拟 bridge 重启：内存记录丢失，resume/load 重建一条空记录再恢复。
+  const rebuilt = makeRecord("acp-1");
+  restoreSession(rebuilt);
+  assert.equal(rebuilt.zcodeSessionId, "sess_abc");
+  assert.deepEqual(rebuilt.model, model);
+  assert.equal(rebuilt.reasoningLevel, "high");
+  assert.equal(rebuilt.mode, "build");
+});
+
+test("restoreSessionLeavesDefaultsForUnknownId", (t) => {
+  isolateStore(t);
+  persistSession(makeRecord("known", { zcodeSessionId: "sess_known" }));
+  const ghost = makeRecord("never-seen");
+  restoreSession(ghost);
+  assert.equal(ghost.zcodeSessionId, undefined);
+  assert.equal(ghost.model, null);
+});
+
+test("persistSessionPrunesOldestBeyondCap", (t) => {
+  const file = isolateStore(t);
+  // 超出 256 上限：最旧淘汰，最新保留。
+  for (let i = 0; i < 260; i++) persistSession(makeRecord(`id-${i}`, { zcodeSessionId: `sess_${i}` }));
+  const store = JSON.parse(readFileSync(file, "utf8"));
+  assert.ok(Object.keys(store).length <= 256);
+  assert.equal(store["id-0"], undefined);
+  assert.equal(store["id-259"].zcodeSessionId, "sess_259");
+});
+
+test("sessionStoreSurvivesCorruptFile", (t) => {
+  const file = isolateStore(t);
+  writeFixture(file, "{ 这不是合法 JSON");
+  const r = makeRecord("x");
+  restoreSession(r); // 损坏文件当空映射，不抛错
+  assert.equal(r.zcodeSessionId, undefined);
+  persistSession(makeRecord("x", { zcodeSessionId: "sess_ok" })); // 覆盖损坏文件
+  const r2 = makeRecord("x");
+  restoreSession(r2);
+  assert.equal(r2.zcodeSessionId, "sess_ok");
+});
+
+test("sessionStoreResistsPrototypePollutionKey", (t) => {
+  isolateStore(t);
+  // 客户端 sessionId 是外部输入：恶意键不得经括号赋值污染原型。
+  persistSession(makeRecord("__proto__", { zcodeSessionId: "sess_evil" }));
+  assert.equal(Object.prototype.zcodeSessionId, undefined);
+  persistSession(makeRecord("normal", { zcodeSessionId: "sess_normal" }));
+  const normal = makeRecord("normal");
+  restoreSession(normal);
+  assert.equal(normal.zcodeSessionId, "sess_normal");
+  // 恶意键作为普通自有键存取，不影响其它会话。
+  const evil = makeRecord("__proto__");
+  restoreSession(evil);
+  assert.equal(evil.zcodeSessionId, "sess_evil");
+});
+
+test("logEventAppendsNdjsonWhenConfigured", async (t) => {
+  const dir = makeTempDir(t);
+  isolateEnv(t, ["ZCODE_ACP_LOG"]);
+  const logPath = path.join(dir, "logs", "acp.log");
+  process.env.ZCODE_ACP_LOG = logPath;
+  logEvent("turn.start", { mode: "yolo" });
+  logEvent("turn.end", { failed: true });
+  // appendFile 是异步追加：轮询等两行落齐再断言。
+  let lines = [];
+  for (let i = 0; i < 50; i++) {
+    if (existsSync(logPath)) {
+      lines = readFileSync(logPath, "utf8").trim().split("\n");
+      if (lines.length >= 2) break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(lines.length, 2);
+  const start = JSON.parse(lines[0]);
+  assert.equal(start.event, "turn.start");
+  assert.equal(start.mode, "yolo");
+  assert.ok(start.ts);
+  assert.equal(JSON.parse(lines[1]).event, "turn.end");
+});
+
+test("logEventWritesNothingWithoutEnv", async (t) => {
+  const dir = makeTempDir(t);
+  isolateEnv(t, ["ZCODE_ACP_LOG"]);
+  logEvent("noop", {});
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(readdirSync(dir).length, 0);
 });

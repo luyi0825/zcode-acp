@@ -11,6 +11,7 @@ import path from "node:path";
 import { resolveZcode } from "./cli-locate.js";
 import { builtinProviderConfigAt, dataBaseDir, homeDir, mergeRuntimeEnv } from "./runtime-env.js";
 import { writeSelectionConfig } from "./models.js";
+import { logEvent } from "./logger.js";
 
 // CLI 定位在 cli-locate.js；这里转出给 login/commands/doctor 沿用原有导入路径。
 export { resolveZcode };
@@ -41,7 +42,7 @@ function isNoiseLine(line) {
  *   taskkill /T /F 连 shim 带真身及 zcode 工具调用拉起的孙进程一并终止。
  * POSIX：子进程以 detached 启动自成进程组，按组发 SIGKILL；组不存在时退回单进程 kill。
  */
-function killTree(child) {
+export function killTree(child) {
   if (WIN) {
     const pid = child.pid;
     // pid 由 spawn 返回（内核分配的正整数），非数字时退回单进程 kill。
@@ -232,8 +233,8 @@ export function summarizeStderr(stderr) {
  *   默认模型与默认思考级别（见 models.js）
  * @param {(stop: () => void) => void} opts.onStart 子进程启动后交回控柄
  * @param {(e: object) => void} opts.onEvent 每个 stream-json 事件回调
- * @param {string} [opts.envelope] 上下文文本（MiCO 任务模板），写入本轮临时附件
- *   后经 `--attach` 交给 CLI：附件进模型上下文，但不进会话标题与首条消息
+ * @param {string} [opts.envelope] 上下文文本（MiCO 任务模板），仅首轮写入临时附件
+ *   后经 `--attach` 交给 CLI：附件进模型上下文且跨 resume 保留，但不进会话标题与首条消息
  * @returns {Promise<{sessionId?: string, content?: string, error?: string, cancelled?: boolean}>}
  */
 export function runTurn({ cwd, text, resume, mode, model, envelope, onStart, onEvent }) {
@@ -254,8 +255,11 @@ export function runTurn({ cwd, text, resume, mode, model, envelope, onStart, onE
   }
 
   // 上下文附件：写到本轮独享临时目录，进程结束后整目录删除。
+  // 只在首轮（无 --resume）挂入：附件内容跨 --resume 持久保留（见 prompt-envelope.js），
+  // 续接轮再挂会在会话里累积出重复的 context.md 文件 part；首轮挂一次即够全程使用。
+  // shortcut: 首轮无信封、续接轮才出现信封的罕见场景会漏挂, 出现该场景再改为按会话跟踪已挂状态。
   // 写失败不阻断执行——退回把文本拼进 prompt 会让标题变脏，但功能优先。
-  const attachmentDir = typeof envelope === "string" && envelope.trim()
+  const attachmentDir = !resume && typeof envelope === "string" && envelope.trim()
     ? mkdtempSync(path.join(tmpdir(), "zcode-acp-context-"))
     : null;
   const attachments = [];
@@ -272,6 +276,18 @@ export function runTurn({ cwd, text, resume, mode, model, envelope, onStart, onE
       // Windows 上子进程刚退出时句柄可能还没释放，留给系统临时目录清理。
     }
   };
+
+  // 每轮生命周期落日志（spawn 参数与退出结果）：宿主侧行为异常时这是唯一现场。
+  const startedAt = Date.now();
+  logEvent("turn.start", {
+    cwd,
+    mode: safeMode,
+    resumed: Boolean(resume),
+    textLength: text.length,
+    model: model?.modelId,
+    reasoningLevel: model?.reasoningLevel,
+    envelope: Boolean(attachmentDir),
+  });
 
   return new Promise((resolve) => {
     const child = spawn(node, buildArgs({ cli, text, cwd, resume, mode: safeMode, attachments }), {
@@ -290,6 +306,12 @@ export function runTurn({ cwd, text, resume, mode, model, envelope, onStart, onE
     const finish = (result) => {
       if (settled) return;
       settled = true;
+      logEvent("turn.end", {
+        ms: Date.now() - startedAt,
+        cancelled: Boolean(result.cancelled),
+        failed: Boolean(result.error),
+        hasContent: result.content !== undefined,
+      });
       // 临时上下文附件只服务本轮进程，收尾时一并删除（含所有提前返回路径）。
       cleanup();
       resolve(result);
